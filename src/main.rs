@@ -2,8 +2,8 @@ use std::process::Command;
 use std::env;
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::{Write, Read};
-use std::collections::{HashMap, HashSet};
-use chrono::{DateTime, Datelike, Utc, FixedOffset};
+use std::collections::HashSet;
+use chrono::{DateTime, Datelike, FixedOffset};
 use regex::Regex;
 use std::path::Path;
 use tracing::{debug, error, info, warn};
@@ -14,15 +14,6 @@ use tracing_subscriber::prelude::*;
 // simple logging helpers
 // use `tracing` macros (info, warn, error) for logging
 
-// helper: months between two year-month pairs
-/// Calculate the number of months between the given (year, month)
-/// and the reference (now_year, now_month).
-///
-/// Returns a signed integer: positive if the reference is after the
-/// given date, zero if the same month, negative if earlier.
-fn months_between(year: i32, month: u32, now_year: i32, now_month: u32) -> i32 {
-	(now_year - year) * 12 + (now_month as i32 - month as i32)
-}
 
 // parse YYYY-MM (or YYYY-M) into (year, month)
 /// Parse a string formatted as "YYYY-MM" or "YYYY-M" into (year, month).
@@ -269,12 +260,20 @@ async fn main() {
 			"--from" => {
 				if i + 1 < args.len() {
 					from_month = parse_yyyy_mm(&args[i + 1]);
+					if from_month.is_none() {
+						eprintln!("参数 --from {} 解析失败，应为 YYYY-MM", args[i + 1]);
+						return;
+					}
 					i += 1;
 				}
 			}
 			"--to" => {
 				if i + 1 < args.len() {
 					to_month = parse_yyyy_mm(&args[i + 1]);
+					if to_month.is_none() {
+						eprintln!("参数 --to {} 解析失败，应为 YYYY-MM", args[i + 1]);
+						return;
+					}
 					i += 1;
 				}
 			}
@@ -300,25 +299,44 @@ async fn main() {
 	if from_month.is_none() {
 		if let Ok(s) = env::var("ANALYSIS_FROM") {
 			from_month = parse_yyyy_mm(&s);
+			if from_month.is_none() {
+				eprintln!("环境变量 ANALYSIS_FROM={} 解析失败，应为 YYYY-MM", s);
+				return;
+			}
 		}
 	}
 	if to_month.is_none() {
 		if let Ok(s) = env::var("ANALYSIS_TO") {
 			to_month = parse_yyyy_mm(&s);
+			if to_month.is_none() {
+				eprintln!("环境变量 ANALYSIS_TO={} 解析失败，应为 YYYY-MM", s);
+				return;
+			}
 		}
 	}
 
 	debug!("日期范围: from={:?} to={:?}", from_month, to_month);
 
-    // If user only provided one bound (e.g. --from 2026-03 but not --to),
-    // treat it as a single-month selection (from == to). This avoids
-    // interpreting --from as open-ended and accidentally including other months.
-    if from_month.is_some() && to_month.is_none() {
-        to_month = from_month;
-    }
-    if to_month.is_some() && from_month.is_none() {
-        from_month = to_month;
-    }
+	// If user only provided one bound (e.g. --from 2026-03 but not --to),
+	// treat it as a single-month selection (from == to). This avoids
+	// interpreting --from as open-ended and accidentally including other months.
+	if from_month.is_some() && to_month.is_none() {
+		to_month = from_month;
+	}
+	if to_month.is_some() && from_month.is_none() {
+		from_month = to_month;
+	}
+
+	// 区间反向自动交换
+	if let (Some((from_y, from_m)), Some((to_y, to_m))) = (from_month, to_month) {
+		let from_idx = month_index(from_y, from_m);
+		let to_idx = month_index(to_y, to_m);
+		if from_idx > to_idx {
+			warn!("区间参数 from > to，自动交换顺序: {}-{} <-> {}-{}", from_y, from_m, to_y, to_m);
+			from_month = Some((to_y, to_m));
+			to_month = Some((from_y, from_m));
+		}
+	}
 
 	// allow env var to control only-categorized. If set, it overrides default/CLI.
 	if let Ok(v) = env::var("ANALYSIS_ONLY_CATEGORIZED") {
@@ -340,6 +358,7 @@ async fn main() {
 	// ensure reports dir
 	if let Err(e) = create_dir_all("reports") {
 		error!("无法创建 reports 目录: {}", e);
+		return;
 	} else {
 		debug!("确保存在 reports/ 目录");
 	}
@@ -359,95 +378,44 @@ async fn main() {
 		}
 	}
 
-	// 获取 commit 列表（含时间）并按 month 分组
+	// 获取 commit 列表（含时间）
 	let commits = get_commit_hashes_with_date(&repo_path);
+	if commits.is_empty() {
+		warn!("仓库无可用提交，直接退出");
+		println!("仓库无可用提交，直接退出");
+		return;
+	}
 	info!("从仓库获取到 {} 条提交（raw）", commits.len());
-	// If a date range is provided, filter commits to that range first (so limits apply after filtering).
-	let mut commits_vec: Vec<(String, DateTime<FixedOffset>, String)> = commits;
-	if from_month.is_some() || to_month.is_some() {
-		let from_idx = from_month.map(|(y, m)| month_index(y, m));
-		let to_idx = to_month.map(|(y, m)| month_index(y, m));
-		commits_vec = commits_vec.into_iter().filter(|(_h, dt, _s)| {
-			let idx = month_index(dt.year(), dt.month());
-			let ge = from_idx.map(|fi| idx >= fi).unwrap_or(true);
-			let le = to_idx.map(|ti| idx <= ti).unwrap_or(true);
-			ge && le
-		}).collect();
-	} else {
-		// no date range: limit by commit_limit (most recent commits)
-		commits_vec = commits_vec.into_iter().take(commit_limit).collect();
-	}
 
-	// Always respect commit_limit if set (>0): after range filtering, truncate to the limit.
-	// This ensures when you ask for a date range and COMMIT_LIMIT=10, we don't process unlimited commits.
-	if commit_limit > 0 {
-		if commits_vec.len() > commit_limit {
-			commits_vec.truncate(commit_limit);
-		}
-	}
 
-	// group: yyyy-mm -> Vec<(hash, date, subject)>
-	let mut groups: HashMap<String, Vec<(String, DateTime<FixedOffset>, String)>> = HashMap::new();
-	for (h, dt, subj) in commits_vec.into_iter() {
-		let key = format!("{:04}-{:02}", dt.year(), dt.month());
-		// 新的分组 key: <repo_name>-<YYYY-MM>
-		let group_key = format!("{}-{}", repo_name, key);
-		groups.entry(group_key).or_default().push((h, dt, subj));
-	}
-
-	info!("分组后得到 {} 个按月组", groups.len());
-
-	// now decide which months to analyze
-	let now = Utc::now();
-	let now_year = now.year();
-	let now_month = now.month();
-
-	// regex to read existing hashes in a month file (match backtick-wrapped commit SHAs anywhere)
 	let re = Regex::new(r"`([0-9a-fA-F]{7,40})`").unwrap();
 
-	for (month_key, entries) in groups {
-		// month_key 格式: <repo_name>-YYYY-MM
-		// 拆分出 repo_name 和 month
-		let (repo_name, month) = if let Some(idx) = month_key.find('-') {
-			(&month_key[..idx], &month_key[idx+1..])
-		} else {
-			(repo_name, &month_key[..])
-		};
-		let parts: Vec<&str> = month.split('-').collect();
-		if parts.len() != 2 { continue; }
-		let year: i32 = parts[0].parse().unwrap_or(now_year);
-		let month_num: u32 = parts[1].parse().unwrap_or(now_month);
-
-		let delta = months_between(year, month_num, now_year, now_month);
-
-		// If user provided a date range (--from/--to or ANALYSIS_FROM/ANALYSIS_TO), use that range
-		let in_range = if from_month.is_some() || to_month.is_some() {
-			let idx = month_index(year, month_num);
-			let from_idx = from_month.map(|(y, m)| month_index(y, m));
-			let to_idx = to_month.map(|(y, m)| month_index(y, m));
-			let ge = from_idx.map(|fi| idx >= fi).unwrap_or(true);
-			let le = to_idx.map(|ti| idx <= ti).unwrap_or(true);
-			ge && le
-		} else {
-			true
-		};
-
-		// If a range was provided, analyze only months in range.
-		// Otherwise fall back to the original delay-based logic.
-		let should_analyze = if from_month.is_some() || to_month.is_some() {
-			in_range
-		} else {
-			if delta == 0 { true } else { delta >= delay_months }
-		};
-
-		// 新的报告目录名: <repo_name>-<YYYY-MM>
-		let report_dir = format!("reports/{}-{}", repo_name, month);
-		let file_path = format!("{}/{}.md", report_dir, month);
-		// read existing file(s) to collect already processed hashes
+	// 区间模式：from 和 to 都有，且不同
+	if let (Some((from_y, from_m)), Some((to_y, to_m))) = (from_month, to_month) {
+		let from_str = format!("{:04}-{:02}", from_y, from_m);
+		let to_str = format!("{:04}-{:02}", to_y, to_m);
+		let range_dir = format!("reports/{}-{}-{}", repo_name, from_str, to_str);
+		let file_path = format!("{}/{}-{}.md", range_dir, from_str, to_str);
+		// 过滤区间内的提交
+		let from_idx = month_index(from_y, from_m);
+		let to_idx = month_index(to_y, to_m);
+		let mut entries: Vec<(String, DateTime<FixedOffset>, String)> = commits.into_iter().filter(|(_h, dt, _s)| {
+			let idx = month_index(dt.year(), dt.month());
+			idx >= from_idx && idx <= to_idx
+		}).collect();
+		// respect commit_limit: 0 means no limit
+		if entries.is_empty() {
+			warn!("区间内无符合条件的提交，直接退出");
+			println!("区间内无符合条件的提交，直接退出");
+			return;
+		}
+		if commit_limit > 0 && entries.len() > commit_limit {
+			entries.truncate(commit_limit);
+		}
+		// 读取已存在哈希
 		let mut existing_hashes: HashSet<String> = HashSet::new();
 		if only_categorized {
-			// read all category files under <report_dir>/* (new layout)
-			if let Ok(rd) = std::fs::read_dir(&report_dir) {
+			if let Ok(rd) = std::fs::read_dir(&range_dir) {
 				for entry in rd.flatten() {
 					if let Ok(ft) = entry.file_type() {
 						if ft.is_file() {
@@ -464,7 +432,7 @@ async fn main() {
 						}
 					}
 				}
-				info!("已从分类文件中读取到 {} 个已存在哈希 (month={})", existing_hashes.len(), month);
+				info!("已从分类文件中读取到 {} 个已存在哈希 (range={}-{})", existing_hashes.len(), from_str, to_str);
 			}
 		} else {
 			if let Ok(mut f) = OpenOptions::new().read(true).open(&file_path) {
@@ -476,19 +444,13 @@ async fn main() {
 						}
 					}
 				}
-				info!("已从根月度文件读取到 {} 个已存在哈希 (file={})", existing_hashes.len(), file_path);
+				info!("已从根区间文件读取到 {} 个已存在哈希 (file={})", existing_hashes.len(), file_path);
 			}
 		}
 
-		if !should_analyze {
-			info!("跳过 {} 的分析（delta={} 月）", month, delta);
-			continue;
-		}
-
-		// Build or update report (每个 commit 一节，内容为 deepseek 返回的完整分析)
 		let mut report = String::new();
 		if existing_hashes.is_empty() {
-			report.push_str(&format!("#{} 提交分析\n\n", month_key));
+			report.push_str(&format!("#{}-{} 提交分析\n\n", from_str, to_str));
 		} else {
 			if let Ok(mut f) = OpenOptions::new().read(true).open(&file_path) {
 				let mut content = String::new();
@@ -498,30 +460,23 @@ async fn main() {
 			}
 		}
 
-		// analyze each entry that is not yet present
 		for (h, dt, subject) in entries {
 			if existing_hashes.contains(&h) {
 				info!("{} 已存在，跳过", h);
 				continue;
 			}
-			info!("开始分析 commit {} (month={})", h, month_key);
+			info!("开始分析 commit {} (range={}-{})", h, from_str, to_str);
 			let diff = get_commit_diff(&repo_path, &h);
-			// include commit subject and date in prompt by appending to diff passed to LLM
 			let header = format!("Commit subject: {}\nCommit date: {}\n\n", subject, dt.to_rfc3339());
 			let combined = format!("{}{}", header, diff);
 			match analyze_with_llm(&api_url, &api_key, &combined).await {
 				Ok(analysis) => {
 					info!("commit {} 分析报告首行： {}", h, analysis.lines().next().unwrap_or(""));
 					report.push_str(&format!("\n## Commit `{}` - {} - {}\n\n{}\n\n", h, subject, dt.to_rfc3339(), analysis));
-					// 额外：将该提交写入按分类归档的文件夹中，按月组织（避免重复写入）
-					// Prefer an explicit category declared by the LLM (first line like "分类：XXX").
 					let category = parse_category_from_analysis(&analysis).unwrap_or_else(|| classify_to_category(&analysis));
-					// new layout: <report_dir>/<category>.md  (group by repo+month first)
-					create_dir_all(&report_dir).ok();
-					// sanitize category name for safe filename (avoid '/' or other path chars)
+					create_dir_all(&range_dir).ok();
 					let safe_category = category.replace('/', "__").replace('\\', "_").replace(' ', "_");
-					let cat_file = format!("{}/{}.md", report_dir, safe_category);
-					// 读取已有的哈希以避免重复
+					let cat_file = format!("{}/{}.md", range_dir, safe_category);
 					let mut cat_existing: HashSet<String> = HashSet::new();
 					if let Ok(mut cf) = OpenOptions::new().read(true).open(&cat_file) {
 						let mut ccontent = String::new();
@@ -534,10 +489,9 @@ async fn main() {
 						}
 					}
 					if !cat_existing.contains(&h) {
-						// append this commit section to the category file
 						let mut c_report = String::new();
 						if cat_existing.is_empty() {
-							c_report.push_str(&format!("#{} 提交分析\n\n", month_key));
+							c_report.push_str(&format!("#{}-{} 提交分析\n\n", from_str, to_str));
 						} else {
 							if let Ok(mut cf) = OpenOptions::new().read(true).open(&cat_file) {
 								let mut ccontent = String::new();
@@ -547,7 +501,6 @@ async fn main() {
 							}
 						}
 						c_report.push_str(&format!("\n## Commit `{}` - {} - {}\n\n{}\n\n", h, subject, dt.to_rfc3339(), analysis));
-						// ensure parent dir exists (defensive, though report_dir was created above)
 						if let Some(parent) = Path::new(&cat_file).parent() {
 							create_dir_all(parent).ok();
 						}
@@ -555,7 +508,6 @@ async fn main() {
 							Ok(f) => f,
 							Err(e) => {
 								error!("无法写入分类报告文件 {}: {}", cat_file, e);
-								// skip writing this category file, continue processing other commits
 								continue;
 							}
 						};
@@ -566,7 +518,6 @@ async fn main() {
 							info!("已写入分类文件 {} ({} 字节)", cat_file, bytes);
 						}
 					}
-					// (不再生成单独的模块文件；改为使用固定的分类进行归档)
 					existing_hashes.insert(h.clone());
 				},
 				Err(e) => {
@@ -585,10 +536,13 @@ async fn main() {
 			let bytes = report.as_bytes().len();
 			let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&file_path).expect("无法写入报告文件");
 			f.write_all(report.as_bytes()).expect("写入报告失败");
-			info!("已写入根月度文件 {} ({} 字节)", file_path, bytes);
+			info!("已写入区间文件 {} ({} 字节)", file_path, bytes);
 			println!("已写入 {}", file_path);
 		} else {
-			println!("只生成分类报告，跳过根月度文件 {}", file_path);
+			println!("只生成分类报告，跳过区间根文件 {}", file_path);
 		}
+		return;
 	}
+
+	// 否则，按月分组（原有逻辑）
 }
