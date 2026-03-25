@@ -1,10 +1,8 @@
 use std::process::Command;
 use std::env;
 use std::fs::{create_dir_all, OpenOptions};
-use std::io::{Write, Read};
-use std::collections::HashSet;
+use std::io::Write;
 use chrono::{DateTime, Datelike, FixedOffset};
-use regex::Regex;
 use std::path::Path;
 use tracing::{debug, error, info, warn};
 use tracing_appender::rolling::RollingFileAppender;
@@ -250,9 +248,7 @@ async fn main() {
 	// optional: CLI args --from YYYY-MM and --to YYYY-MM, or fall back to env ANALYSIS_FROM / ANALYSIS_TO
 	let mut from_month: Option<(i32, u32)> = None;
 	let mut to_month: Option<(i32, u32)> = None;
-	// 默认只生成按月份归档的分类报告（不再生成根级 monthly 文件）。
-	// 使用 --root 或 ANALYSIS_ONLY_CATEGORIZED=0 可以恢复生成根文件。
-	let mut only_categorized = true;
+	// 旧逻辑遗留变量，已不再使用，无需定义 only_categorized
 	let args: Vec<String> = env::args().collect();
 	let mut i = 1;
 	while i < args.len() {
@@ -278,11 +274,10 @@ async fn main() {
 				}
 			}
 			"--only-categorized" => {
-				only_categorized = true;
+				// 已废弃参数，无需处理
 			}
 			"--root" => {
-				// 显式要求生成根级月度文件（legacy 行为）
-				only_categorized = false;
+				// 已废弃参数，无需处理
 			}
 			"--limit" => {
 				if i + 1 < args.len() {
@@ -338,15 +333,7 @@ async fn main() {
 		}
 	}
 
-	// allow env var to control only-categorized. If set, it overrides default/CLI.
-	if let Ok(v) = env::var("ANALYSIS_ONLY_CATEGORIZED") {
-		let lv = v.to_lowercase();
-		if lv == "1" || lv == "true" || lv == "yes" {
-			only_categorized = true;
-		} else if lv == "0" || lv == "false" || lv == "no" {
-			only_categorized = false;
-		}
-	}
+	// allow env var to control only-categorized. 已废弃，无需处理
 
 	// also allow ANALYSIS_LIMIT to override commit_limit
 	if let Ok(v) = env::var("ANALYSIS_LIMIT") {
@@ -388,22 +375,23 @@ async fn main() {
 	info!("从仓库获取到 {} 条提交（raw）", commits.len());
 
 
-	let re = Regex::new(r"`([0-9a-fA-F]{7,40})`").unwrap();
 
-	// 区间模式：from 和 to 都有，且不同
+	// 新规则：只生成一个md文档，所有模块分析写入该文件
 	if let (Some((from_y, from_m)), Some((to_y, to_m))) = (from_month, to_month) {
 		let from_str = format!("{:04}-{:02}", from_y, from_m);
 		let to_str = format!("{:04}-{:02}", to_y, to_m);
-		let range_dir = format!("reports/{}-{}-{}", repo_name, from_str, to_str);
-		let file_path = format!("{}/{}-{}.md", range_dir, from_str, to_str);
-		// 过滤区间内的提交
+		let file_name = if from_str == to_str {
+			format!("{}-{}.md", repo_name, from_str)
+		} else {
+			format!("{}-{}-{}.md", repo_name, from_str, to_str)
+		};
+		let file_path = format!("reports/{}", file_name);
 		let from_idx = month_index(from_y, from_m);
 		let to_idx = month_index(to_y, to_m);
 		let mut entries: Vec<(String, DateTime<FixedOffset>, String)> = commits.into_iter().filter(|(_h, dt, _s)| {
 			let idx = month_index(dt.year(), dt.month());
 			idx >= from_idx && idx <= to_idx
 		}).collect();
-		// respect commit_limit: 0 means no limit
 		if entries.is_empty() {
 			warn!("区间内无符合条件的提交，直接退出");
 			println!("区间内无符合条件的提交，直接退出");
@@ -412,135 +400,70 @@ async fn main() {
 		if commit_limit > 0 && entries.len() > commit_limit {
 			entries.truncate(commit_limit);
 		}
-		// 读取已存在哈希
-		let mut existing_hashes: HashSet<String> = HashSet::new();
-		if only_categorized {
-			if let Ok(rd) = std::fs::read_dir(&range_dir) {
-				for entry in rd.flatten() {
-					if let Ok(ft) = entry.file_type() {
-						if ft.is_file() {
-							if let Ok(mut cf) = OpenOptions::new().read(true).open(entry.path()) {
-								let mut ccontent = String::new();
-								if cf.read_to_string(&mut ccontent).is_ok() {
-									for cap in re.captures_iter(&ccontent) {
-										if let Some(m) = cap.get(1) {
-											existing_hashes.insert(m.as_str().to_string());
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-				info!("已从分类文件中读取到 {} 个已存在哈希 (range={}-{})", existing_hashes.len(), from_str, to_str);
-			}
-		} else {
-			if let Ok(mut f) = OpenOptions::new().read(true).open(&file_path) {
-				let mut content = String::new();
-				if f.read_to_string(&mut content).is_ok() {
-					for cap in re.captures_iter(&content) {
-						if let Some(m) = cap.get(1) {
-							existing_hashes.insert(m.as_str().to_string());
-						}
-					}
-				}
-				info!("已从根区间文件读取到 {} 个已存在哈希 (file={})", existing_hashes.len(), file_path);
-			}
-		}
 
+		use std::collections::BTreeMap;
 		let mut report = String::new();
-		if existing_hashes.is_empty() {
-			report.push_str(&format!("#{}-{} 提交分析\n\n", from_str, to_str));
+		report.push_str(&format!("# {} 提交分析报告\n\n", repo_name));
+		if from_str == to_str {
+			report.push_str(&format!("## 分析区间：{}\n\n", from_str));
 		} else {
-			if let Ok(mut f) = OpenOptions::new().read(true).open(&file_path) {
-				let mut content = String::new();
-				if f.read_to_string(&mut content).is_ok() {
-					report.push_str(&content);
-				}
-			}
+			report.push_str(&format!("## 分析区间：{} 至 {}\n\n", from_str, to_str));
 		}
+		report.push_str("---\n\n");
 
-		for (h, dt, subject) in entries {
-			if existing_hashes.contains(&h) {
-				info!("{} 已存在，跳过", h);
-				continue;
-			}
-			info!("开始分析 commit {} (range={}-{})", h, from_str, to_str);
-			let diff = get_commit_diff(&repo_path, &h);
+		// 先分析所有commit，按类型分组
+		let mut type_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+		for (_idx, (h, dt, subject)) in entries.iter().enumerate() {
+			let diff = get_commit_diff(&repo_path, h);
 			let header = format!("Commit subject: {}\nCommit date: {}\n\n", subject, dt.to_rfc3339());
 			let combined = format!("{}{}", header, diff);
+			   let entry_title = format!("**Commit `{}`**  \n**提交时间：{}**  \n**提交标题：{}**  \n\n", h, dt.format("%Y-%m-%d %H:%M:%S %:z"), subject);
 			match analyze_with_llm(&api_url, &api_key, &combined).await {
 				Ok(analysis) => {
-					info!("commit {} 分析报告首行： {}", h, analysis.lines().next().unwrap_or(""));
-					report.push_str(&format!("\n## Commit `{}` - {} - {}\n\n{}\n\n", h, subject, dt.to_rfc3339(), analysis));
 					let category = parse_category_from_analysis(&analysis).unwrap_or_else(|| classify_to_category(&analysis));
-					create_dir_all(&range_dir).ok();
-					let safe_category = category.replace('/', "__").replace('\\', "_").replace(' ', "_");
-					let cat_file = format!("{}/{}.md", range_dir, safe_category);
-					let mut cat_existing: HashSet<String> = HashSet::new();
-					if let Ok(mut cf) = OpenOptions::new().read(true).open(&cat_file) {
-						let mut ccontent = String::new();
-						if cf.read_to_string(&mut ccontent).is_ok() {
-							for cap in re.captures_iter(&ccontent) {
-								if let Some(m) = cap.get(1) {
-									cat_existing.insert(m.as_str().to_string());
-								}
-							}
-						}
-					}
-					if !cat_existing.contains(&h) {
-						let mut c_report = String::new();
-						if cat_existing.is_empty() {
-							c_report.push_str(&format!("#{}-{} 提交分析\n\n", from_str, to_str));
-						} else {
-							if let Ok(mut cf) = OpenOptions::new().read(true).open(&cat_file) {
-								let mut ccontent = String::new();
-								if cf.read_to_string(&mut ccontent).is_ok() {
-									c_report.push_str(&ccontent);
-								}
-							}
-						}
-						c_report.push_str(&format!("\n## Commit `{}` - {} - {}\n\n{}\n\n", h, subject, dt.to_rfc3339(), analysis));
-						if let Some(parent) = Path::new(&cat_file).parent() {
-							create_dir_all(parent).ok();
-						}
-						let mut cfw = match OpenOptions::new().create(true).write(true).truncate(true).open(&cat_file) {
-							Ok(f) => f,
-							Err(e) => {
-								error!("无法写入分类报告文件 {}: {}", cat_file, e);
-								continue;
-							}
-						};
-						let bytes = c_report.as_bytes().len();
-						if let Err(e) = cfw.write_all(c_report.as_bytes()) {
-							error!("写入分类报告失败 {}: {}", cat_file, e);
-						} else {
-							info!("已写入分类文件 {} ({} 字节)", cat_file, bytes);
-						}
-					}
-					existing_hashes.insert(h.clone());
+					   let mut entry = String::new();
+					   entry.push_str(&entry_title);
+					   // Forbid all headings except main and category; convert all other headings to bold
+					   let mut lines = analysis.lines();
+					   while let Some(line) = lines.next() {
+						   let trimmed = line.trim_start();
+						   if trimmed.starts_with('#') {
+							   // Remove all heading marks, convert to bold
+							   let title = trimmed.trim_start_matches('#').trim();
+							   if !title.is_empty() {
+								   entry.push_str(&format!("**{}**\n", title));
+							   }
+						   } else {
+							   entry.push_str(line);
+							   entry.push('\n');
+						   }
+					   }
+					   entry.push_str("\n---\n\n");
+					   type_map.entry(category.to_string()).or_default().push(entry);
 				},
 				Err(e) => {
-						error!("分析失败: {}", e);
-					report.push_str(&format!("\n## Commit `{}` - {}\n\n分析失败: {}\n\n", h, subject, e));
-					existing_hashes.insert(h.clone());
+					let mut entry = String::new();
+					entry.push_str(&entry_title);
+					entry.push_str(&format!("**分析失败：{}**\n\n---\n\n", e));
+					type_map.entry("分析失败".to_string()).or_default().push(entry);
 				}
 			}
 		}
 
-		if !only_categorized {
-			if report.contains("由 pr-tools 自动生成") == false {
-				report.push_str("\n---\n\n> 由 pr-tools 自动生成\n");
+		// 输出分组内容
+		for (cat, entries) in &type_map {
+			   report.push_str(&format!("## {}\n\n", cat));
+			for entry in entries {
+				report.push_str(entry);
 			}
-
-			let bytes = report.as_bytes().len();
-			let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&file_path).expect("无法写入报告文件");
-			f.write_all(report.as_bytes()).expect("写入报告失败");
-			info!("已写入区间文件 {} ({} 字节)", file_path, bytes);
-			println!("已写入 {}", file_path);
-		} else {
-			println!("只生成分类报告，跳过区间根文件 {}", file_path);
 		}
+
+		report.push_str("> 由 pr-tools 自动生成\n");
+		let bytes = report.as_bytes().len();
+		let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&file_path).expect("无法写入报告文件");
+		f.write_all(report.as_bytes()).expect("写入报告失败");
+		info!("已写入分析报告 {} ({} 字节)", file_path, bytes);
+		println!("已写入 {}", file_path);
 		return;
 	}
 
