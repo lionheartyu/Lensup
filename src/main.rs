@@ -247,6 +247,11 @@ async fn main() {
 	let api_key = env::var("DEEPSEEK_API_KEY").expect("请设置 DEEPSEEK_API_KEY 环境变量");
 	let api_url = env::var("LLM_BASE_URL").expect("请设置 LLM_BASE_URL 环境变量");
 	let repo_path = env::var("REPO_PATH").expect("请设置 REPO_PATH 环境变量");
+	// 获取库名（repo_path 最后一级目录名）
+	let repo_name = Path::new(&repo_path)
+		.file_name()
+		.and_then(|s| s.to_str())
+		.unwrap_or("repo");
 	let mut commit_limit: usize = env::var("COMMIT_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
 	let delay_months: i32 = env::var("ANALYSIS_DELAY_MONTHS").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
 	info!("配置: repo_path={}, commit_limit={}, delay_months={}, only_categorized(default)={}", repo_path, commit_limit, delay_months, true);
@@ -385,7 +390,9 @@ async fn main() {
 	let mut groups: HashMap<String, Vec<(String, DateTime<FixedOffset>, String)>> = HashMap::new();
 	for (h, dt, subj) in commits_vec.into_iter() {
 		let key = format!("{:04}-{:02}", dt.year(), dt.month());
-		groups.entry(key).or_default().push((h, dt, subj));
+		// 新的分组 key: <repo_name>-<YYYY-MM>
+		let group_key = format!("{}-{}", repo_name, key);
+		groups.entry(group_key).or_default().push((h, dt, subj));
 	}
 
 	info!("分组后得到 {} 个按月组", groups.len());
@@ -398,8 +405,14 @@ async fn main() {
 	// regex to read existing hashes in a month file (match backtick-wrapped commit SHAs anywhere)
 	let re = Regex::new(r"`([0-9a-fA-F]{7,40})`").unwrap();
 
-	for (month, entries) in groups {
-		// parse month into year/month
+	for (month_key, entries) in groups {
+		// month_key 格式: <repo_name>-YYYY-MM
+		// 拆分出 repo_name 和 month
+		let (repo_name, month) = if let Some(idx) = month_key.find('-') {
+			(&month_key[..idx], &month_key[idx+1..])
+		} else {
+			(repo_name, &month_key[..])
+		};
 		let parts: Vec<&str> = month.split('-').collect();
 		if parts.len() != 2 { continue; }
 		let year: i32 = parts[0].parse().unwrap_or(now_year);
@@ -427,13 +440,14 @@ async fn main() {
 			if delta == 0 { true } else { delta >= delay_months }
 		};
 
-		let file_path = format!("reports/{}.md", month);
+		// 新的报告目录名: <repo_name>-<YYYY-MM>
+		let report_dir = format!("reports/{}-{}", repo_name, month);
+		let file_path = format!("{}/{}.md", report_dir, month);
 		// read existing file(s) to collect already processed hashes
 		let mut existing_hashes: HashSet<String> = HashSet::new();
 		if only_categorized {
-			// read all category files under reports/<month>/* (new layout)
-			let month_dir = format!("reports/{}", month);
-			if let Ok(rd) = std::fs::read_dir(&month_dir) {
+			// read all category files under <report_dir>/* (new layout)
+			if let Ok(rd) = std::fs::read_dir(&report_dir) {
 				for entry in rd.flatten() {
 					if let Ok(ft) = entry.file_type() {
 						if ft.is_file() {
@@ -474,7 +488,7 @@ async fn main() {
 		// Build or update report (每个 commit 一节，内容为 deepseek 返回的完整分析)
 		let mut report = String::new();
 		if existing_hashes.is_empty() {
-			report.push_str(&format!("# {} 提交分析\n\n", month));
+			report.push_str(&format!("#{} 提交分析\n\n", month_key));
 		} else {
 			if let Ok(mut f) = OpenOptions::new().read(true).open(&file_path) {
 				let mut content = String::new();
@@ -490,7 +504,7 @@ async fn main() {
 				info!("{} 已存在，跳过", h);
 				continue;
 			}
-			info!("开始分析 commit {} (month={})", h, month);
+			info!("开始分析 commit {} (month={})", h, month_key);
 			let diff = get_commit_diff(&repo_path, &h);
 			// include commit subject and date in prompt by appending to diff passed to LLM
 			let header = format!("Commit subject: {}\nCommit date: {}\n\n", subject, dt.to_rfc3339());
@@ -502,12 +516,11 @@ async fn main() {
 					// 额外：将该提交写入按分类归档的文件夹中，按月组织（避免重复写入）
 					// Prefer an explicit category declared by the LLM (first line like "分类：XXX").
 					let category = parse_category_from_analysis(&analysis).unwrap_or_else(|| classify_to_category(&analysis));
-					// new layout: reports/<month>/<category>.md  (group by month first)
-					let month_dir = format!("reports/{}", month);
-					create_dir_all(&month_dir).ok();
+					// new layout: <report_dir>/<category>.md  (group by repo+month first)
+					create_dir_all(&report_dir).ok();
 					// sanitize category name for safe filename (avoid '/' or other path chars)
 					let safe_category = category.replace('/', "__").replace('\\', "_").replace(' ', "_");
-					let cat_file = format!("{}/{}.md", month_dir, safe_category);
+					let cat_file = format!("{}/{}.md", report_dir, safe_category);
 					// 读取已有的哈希以避免重复
 					let mut cat_existing: HashSet<String> = HashSet::new();
 					if let Ok(mut cf) = OpenOptions::new().read(true).open(&cat_file) {
@@ -524,7 +537,7 @@ async fn main() {
 						// append this commit section to the category file
 						let mut c_report = String::new();
 						if cat_existing.is_empty() {
-							c_report.push_str(&format!("# {} 提交分析\n\n", month));
+							c_report.push_str(&format!("#{} 提交分析\n\n", month_key));
 						} else {
 							if let Ok(mut cf) = OpenOptions::new().read(true).open(&cat_file) {
 								let mut ccontent = String::new();
@@ -534,7 +547,7 @@ async fn main() {
 							}
 						}
 						c_report.push_str(&format!("\n## Commit `{}` - {} - {}\n\n{}\n\n", h, subject, dt.to_rfc3339(), analysis));
-						// ensure parent dir exists (defensive, though month_dir was created above)
+						// ensure parent dir exists (defensive, though report_dir was created above)
 						if let Some(parent) = Path::new(&cat_file).parent() {
 							create_dir_all(parent).ok();
 						}
