@@ -606,18 +606,25 @@ async fn main() {
 		   }
 		   report.push_str("\n---\n\n");
 
-		   // 章节3：详细分析（按分类）
-		   for (cat, entries) in &detail_map {
+		   // 章节3：详细分析（按分类，固定顺序，全部输出）
+		   let category_order = [
+			   "bug修复", "功能增强", "性能优化", "安全修复", "构建/CI", "配置变更", "兼容性", "文档变更", "重构", "测试", "其他", "分析失败"
+		   ];
+		   for cat in &category_order {
 			   report.push_str(&format!("## {}\n\n", cat));
-			   for entry in entries {
-				   // 确保每个 entry 结尾有换行和分隔符，避免片段不完整
-				   let trimmed = entry.trim_end();
-				   report.push_str(trimmed);
-				   if !trimmed.ends_with("---") {
-					   report.push_str("\n---\n\n");
-				   } else {
-					   report.push_str("\n\n");
+			   if let Some(entries) = detail_map.get(*cat) {
+				   for entry in entries {
+					   // 确保每个 entry 结尾有换行和分隔符，避免片段不完整
+					   let trimmed = entry.trim_end();
+					   report.push_str(trimmed);
+					   if !trimmed.ends_with("---") {
+						   report.push_str("\n---\n\n");
+					   } else {
+						   report.push_str("\n\n");
+					   }
 				   }
+			   } else {
+				   report.push_str("（本分类本月无相关提交）\n\n");
 			   }
 		   }
 
