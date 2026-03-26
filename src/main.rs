@@ -208,8 +208,8 @@ async fn main() {
 	}
 
 	// Create a rolling daily file appender under logs/
-	// Filename: logs/pr-tools-YYYY-MM-DD.log (handled by tracing_appender)
-	let file_appender: RollingFileAppender = tracing_appender::rolling::daily("logs", "pr-tools.log");
+	// Filename: logs/lensup-YYYY-MM-DD.log (handled by tracing_appender)
+	let file_appender: RollingFileAppender = tracing_appender::rolling::daily("logs", "lensup.log");
 	let (non_blocking, _guard): (NonBlocking, _) = tracing_appender::non_blocking(file_appender);
 
 	// Build two layers: one writing to file (no ANSI colors), another to stdout.
@@ -401,34 +401,52 @@ async fn main() {
 			entries.truncate(commit_limit);
 		}
 
-		use std::collections::BTreeMap;
-		let mut report = String::new();
-		report.push_str(&format!("# {} 提交分析报告\n\n", repo_name));
-		if from_str == to_str {
-			report.push_str(&format!("## 分析区间：{}\n\n", from_str));
-		} else {
-			report.push_str(&format!("## 分析区间：{} 至 {}\n\n", from_str, to_str));
-		}
-		report.push_str("---\n\n");
+		   use std::collections::BTreeMap;
+		   let mut report = String::new();
+		   // 章节1：报告总结
+		   report.push_str(&format!("# {} 提交分析报告\n\n", repo_name));
+		   report.push_str("## 总结\n\n");
+		   let total_commits = entries.len();
+		   if from_str == to_str {
+			   report.push_str(&format!("本报告扫描了 {} 包 {} 月份的提交，共计 {} 个。\n\n", repo_name, from_str, total_commits));
+		   } else {
+			   report.push_str(&format!("本报告扫描了 {} 包 {} 至 {} 的提交，共计 {} 个。\n\n", repo_name, from_str, to_str, total_commits));
+		   }
+		   report.push_str("---\n\n");
 
-		// 先分析所有commit，按类型分组
-		let mut type_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
-		for (_idx, (h, dt, subject)) in entries.iter().enumerate() {
-			let diff = get_commit_diff(&repo_path, h);
-			let header = format!("Commit subject: {}\nCommit date: {}\n\n", subject, dt.to_rfc3339());
-			let combined = format!("{}{}", header, diff);
+		   // 先分析所有commit，按类型分组，收集hash和建议
+		   let mut type_map: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new(); // 分类 -> [(hash, subject, 建议)]
+		   let mut detail_map: BTreeMap<String, Vec<String>> = BTreeMap::new(); // 分类 -> [详细分析]
+		   for (_idx, (h, dt, subject)) in entries.iter().enumerate() {
+			   let diff = get_commit_diff(&repo_path, h);
+			   let header = format!("Commit subject: {}\nCommit date: {}\n\n", subject, dt.to_rfc3339());
+			   let combined = format!("{}{}", header, diff);
 			   let entry_title = format!("**Commit `{}`**  \n**提交时间：{}**  \n**提交标题：{}**  \n\n", h, dt.format("%Y-%m-%d %H:%M:%S %:z"), subject);
-			match analyze_with_llm(&api_url, &api_key, &combined).await {
-				Ok(analysis) => {
-					let category = parse_category_from_analysis(&analysis).unwrap_or_else(|| classify_to_category(&analysis));
+			   match analyze_with_llm(&api_url, &api_key, &combined).await {
+				   Ok(analysis) => {
+					   let category = parse_category_from_analysis(&analysis).unwrap_or_else(|| classify_to_category(&analysis));
+					   // 安全修复和bug修复强制建议合入，其他类型让AI分析建议
+					   let suggestion = if category == "安全修复" || category == "bug修复" {
+						   "建议合入".to_string()
+					   } else {
+						   let mut ai_suggestion = "建议个人复核".to_string();
+						   for line in analysis.lines() {
+							   let l = line.trim();
+							   if l.starts_with("建议：") || l.starts_with("建议:") {
+								   ai_suggestion = l.trim_start_matches("建议：").trim_start_matches("建议:").trim().to_string();
+								   break;
+							   }
+						   }
+						   ai_suggestion
+					   };
+					   type_map.entry(category.to_string()).or_default().push((h.clone(), subject.clone(), suggestion.clone()));
+					   // 详细分析
 					   let mut entry = String::new();
 					   entry.push_str(&entry_title);
-					   // Forbid all headings except main and category; convert all other headings to bold
 					   let mut lines = analysis.lines();
 					   while let Some(line) = lines.next() {
 						   let trimmed = line.trim_start();
 						   if trimmed.starts_with('#') {
-							   // Remove all heading marks, convert to bold
 							   let title = trimmed.trim_start_matches('#').trim();
 							   if !title.is_empty() {
 								   entry.push_str(&format!("**{}**\n", title));
@@ -439,32 +457,43 @@ async fn main() {
 						   }
 					   }
 					   entry.push_str("\n---\n\n");
-					   type_map.entry(category.to_string()).or_default().push(entry);
-				},
-				Err(e) => {
-					let mut entry = String::new();
-					entry.push_str(&entry_title);
-					entry.push_str(&format!("**分析失败：{}**\n\n---\n\n", e));
-					type_map.entry("分析失败".to_string()).or_default().push(entry);
-				}
-			}
-		}
+					   detail_map.entry(category.to_string()).or_default().push(entry);
+				   },
+				   Err(e) => {
+					   let mut entry = String::new();
+					   entry.push_str(&entry_title);
+					   entry.push_str(&format!("**分析失败：{}**\n\n---\n\n", e));
+					   detail_map.entry("分析失败".to_string()).or_default().push(entry);
+					   type_map.entry("分析失败".to_string()).or_default().push((h.clone(), subject.clone(), "建议个人复核".to_string()));
+				   }
+			   }
+		   }
 
-		// 输出分组内容
-		for (cat, entries) in &type_map {
+		   // 章节2：分类汇总表格
+		   report.push_str("## 分类汇总\n\n");
+		   report.push_str("| 分类 | Commit Hash | 提交标题 | 建议 |\n|---|---|---|---|\n");
+		   for (cat, commits) in &type_map {
+			   for (hash, subject, suggestion) in commits {
+				   report.push_str(&format!("| {} | {} | {} | {} |\n", cat, hash, subject.replace('|', " "), suggestion));
+			   }
+		   }
+		   report.push_str("\n---\n\n");
+
+		   // 章节3：详细分析（按分类）
+		   for (cat, entries) in &detail_map {
 			   report.push_str(&format!("## {}\n\n", cat));
-			for entry in entries {
-				report.push_str(entry);
-			}
-		}
+			   for entry in entries {
+				   report.push_str(entry);
+			   }
+		   }
 
-		report.push_str("> 由 pr-tools 自动生成\n");
-		let bytes = report.as_bytes().len();
-		let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&file_path).expect("无法写入报告文件");
-		f.write_all(report.as_bytes()).expect("写入报告失败");
-		info!("已写入分析报告 {} ({} 字节)", file_path, bytes);
-		println!("已写入 {}", file_path);
-		return;
+		   report.push_str("> 由 lensup 自动生成\n");
+		   let bytes = report.as_bytes().len();
+		   let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&file_path).expect("无法写入报告文件");
+		   f.write_all(report.as_bytes()).expect("写入报告失败");
+		   info!("已写入分析报告 {} ({} 字节)", file_path, bytes);
+		   println!("已写入 {}", file_path);
+		   return;
 	}
 
 	// 否则，按月分组（原有逻辑）
