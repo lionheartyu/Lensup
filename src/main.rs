@@ -431,19 +431,28 @@ async fn main() {
 					   if let Some(line) = lines.next() {
 						   impact = line.trim().to_string();
 					   }
-					   // 不再二次分析 summary，无论是否为中文，直接用主分析结果
-					   // 优化建议等级分布逻辑，优先匹配并确保每个等级都能被 deepseek 结果覆盖，且分布更均匀
-					   let suggestion = if category == "安全修复" {
-						   "立刻合入".to_string()
-					   } else if category == "bug修复" {
-						   "建议合入".to_string()
-					   } else if ["文档变更", "构建/CI", "配置变更", "兼容性"].contains(&category) {
-						   // 杂项类型一律归为“不影响”
-						   "不影响".to_string()
-					   } else {
-						   // 依次查找所有建议等级，优先出现的为准，确保每个等级都能被覆盖
+					   // 智能提取建议段落：优先匹配“建议：”或“【建议】”开头的行，否则兜底“人工复核”
+					   let mut suggestion = None;
+					   for line in analysis.lines() {
+						   let l = line.trim();
+						   if l.starts_with("建议：") || l.starts_with("建议:") {
+							   let s = l.trim_start_matches("建议：").trim_start_matches("建议:").trim();
+							   if !s.is_empty() {
+								   suggestion = Some(s.to_string());
+								   break;
+							   }
+						   } else if l.starts_with("【建议】") {
+							   let s = l.trim_start_matches("【建议】").trim();
+							   if !s.is_empty() {
+								   suggestion = Some(s.to_string());
+								   break;
+							   }
+						   }
+					   }
+					   // 兼容原有等级关键词
+					   if suggestion.is_none() {
 						   let mut found = None;
-						   let mut found_level = 10; // 越小优先级越高
+						   let mut found_level = 10;
 						   for line in analysis.lines() {
 							   let l = line.trim();
 							   if l.contains("立刻合入") && found_level > 1 {
@@ -462,32 +471,19 @@ async fn main() {
 								   found = Some("不影响".to_string());
 								   found_level = 4;
 							   }
-							   if l.starts_with("建议：") || l.starts_with("建议:") {
-								   let s = l.trim_start_matches("建议：").trim_start_matches("建议:").trim();
-								   if s.contains("立刻合入") && found_level > 1 {
-									   found = Some("立刻合入".to_string());
-									   found_level = 1;
-								   }
-								   if s.contains("建议合入") && found_level > 2 {
-									   found = Some("建议合入".to_string());
-									   found_level = 2;
-								   }
-								   if s.contains("人工复核") && found_level > 3 {
-									   found = Some("人工复核".to_string());
-									   found_level = 3;
-								   }
-								   if s.contains("不影响") && found_level > 4 {
-									   found = Some("不影响".to_string());
-									   found_level = 4;
-								   }
-							   }
 						   }
-						   found.unwrap_or_else(|| "人工复核".to_string())
+						   suggestion = found;
+					   }
+					   // bug修复和安全修复强制建议合入
+					   let suggestion = match category {
+						   "bug修复" | "安全修复" => "建议合入".to_string(),
+						   _ => suggestion.unwrap_or_else(|| "人工复核".to_string()),
 					   };
+
 					   // summary 为空时 fallback 用 impact
 					   let summary_final = if summary.is_empty() { impact.clone() } else { summary.clone() };
 					   type_map.entry(category.to_string()).or_default().push((short_hash.clone(), summary_final, impact.clone(), suggestion.clone()));
-					   // 详细分析：不再输出 summary/一句话总结，只输出剩余内容，且用长哈希
+					   // 详细分析正文：不再输出 summary/一句话总结，只输出剩余内容，且用长哈希
 					   let mut entry = String::new();
 					   entry.push_str(&entry_title);
 					   let mut lines = analysis.lines();
@@ -496,10 +492,17 @@ async fn main() {
 					   let _ = lines.next();
 					   // 跳过第三行（原本 impact，防止 LLM 把一句话总结写到第三行）
 					   let _ = lines.next();
+					   let mut found_suggestion_in_body = false;
 					   while let Some(line) = lines.next() {
-						   // 跳过任何包含“一句话总结”的行
 						   let trimmed = line.trim_start();
 						   if trimmed.contains("一句话总结") { continue; }
+						   // 检查是否为建议段落
+						   if trimmed.starts_with("建议：") || trimmed.starts_with("建议:") || trimmed.starts_with("【建议】") {
+							   found_suggestion_in_body = true;
+							   entry.push_str(line);
+							   entry.push('\n');
+							   continue;
+						   }
 						   if trimmed.starts_with('#') {
 							   let title = trimmed.trim_start_matches('#').trim();
 							   if !title.is_empty() {
@@ -509,6 +512,10 @@ async fn main() {
 							   entry.push_str(line);
 							   entry.push('\n');
 						   }
+					   }
+					   // 如果正文没有建议段落，补上一行
+					   if !found_suggestion_in_body {
+						   entry.push_str(&format!("回归风险与建议：{}\n", suggestion));
 					   }
 					   entry.push_str("\n---\n\n");
 					   detail_map.entry(category.to_string()).or_default().push(entry);
