@@ -1,3 +1,8 @@
+// _____________________________
+//
+//           lensup
+// _____________________________
+
 use std::process::Command;
 use std::env;
 use std::fs::{create_dir_all, OpenOptions};
@@ -9,11 +14,11 @@ use tracing_appender::rolling::RollingFileAppender;
 use tracing_appender::non_blocking::NonBlocking;
 use tracing_subscriber::prelude::*;
 
-// simple logging helpers
-// use `tracing` macros (info, warn, error) for logging
+
+// 日志记录直接使用 tracing 宏（info, warn, error）
 
 
-// parse YYYY-MM (or YYYY-M) into (year, month)
+// 解析 YYYY-MM (或 YYYY-M) 字符串为 (year, month)
 /// Parse a string formatted as "YYYY-MM" or "YYYY-M" into (year, month).
 /// Returns None if parsing fails or month is out of range.
 fn parse_yyyy_mm(s: &str) -> Option<(i32, u32)> {
@@ -27,8 +32,7 @@ fn parse_yyyy_mm(s: &str) -> Option<(i32, u32)> {
 	None
 }
 
-/// Convert a year/month into a monotonically increasing month index.
-/// Useful for comparing month ranges.
+/// 将年/月转换为单调递增的月份索引，便于区间比较
 fn month_index(year: i32, month: u32) -> i32 {
 	year * 12 + month as i32
 }
@@ -99,7 +103,7 @@ fn parse_category_from_analysis(analysis: &str) -> Option<&'static str> {
 	None
 }
 
-// (已移除) 不再提取并写入单独的 module 文件夹；改为把分析归类到固定的分类文件中
+// 已移除：不再提取并写入单独的 module 文件夹，统一归类到固定分类文件
 
 // 获取 commit 哈希值及提交时间（ISO8601）列表
 /// Return a Vec of (commit_hash, commit_date (with offset), subject) for the
@@ -150,7 +154,7 @@ fn get_commit_diff(repo_path: &str, hash: &str) -> String {
 /// short preview and the HTTP status. The full response is returned if the
 /// JSON structure doesn't match the expected shape.
 async fn analyze_with_llm(api_url: &str, api_key: &str, diff: &str) -> Result<String, reqwest::Error> {
-	let prompt = "请对以下提交（包含 commit subject 与 diff）做详细分析：\n1) 用一句话给出分类（如：bug修复、功能增强、无影响的翻译、文档变更、重构、测试、其他）；\n2) 给出 2-4 行的简要说明，说明修改目的和主要影响；\n3) 列出可能受影响的模块或文件路径（如果能推断）；\n4) 评估回归风险并给出建议（如是否需要回归测试、注意点等）。\n请先输出分类（单行），随后用小标题和段落输出其他内容，使用中文。";
+	let prompt = "请对以下提交（包含 commit subject 与 diff）做详细分析：\n1) 先将 commit subject 翻译成中文，作为‘一句话总结’输出在第二行；\n2) 用一句话给出分类（如：bug修复、功能增强、无影响的翻译、文档变更、重构、测试、其他）；\n3) 给出 2-4 行的简要说明，说明修改目的和主要影响；\n4) 列出可能受影响的模块或文件路径（如果能推断）；\n5) 评估回归风险并给出建议（如是否需要回归测试、注意点等）。\n请先输出分类（单行），再输出 subject 中文翻译（单行），随后用小标题和段落输出其他内容，全部使用中文。";
 	let client = reqwest::Client::new();
 	let user_content = format!("{}\n
 以下是 diff 内容：\n{}", prompt, diff);
@@ -392,6 +396,8 @@ async fn main() {
 			let idx = month_index(dt.year(), dt.month());
 			idx >= from_idx && idx <= to_idx
 		}).collect();
+		let total_in_range = entries.len();
+		info!("区间 {}-{} 至 {}-{} 内剩余 commit 数量: {}", from_y, from_m, to_y, to_m, total_in_range);
 		if entries.is_empty() {
 			warn!("区间内无符合条件的提交，直接退出");
 			println!("区间内无符合条件的提交，直接退出");
@@ -402,50 +408,98 @@ async fn main() {
 		}
 
 		   use std::collections::BTreeMap;
-		   let mut report = String::new();
-		   // 章节1：报告总结
-		   report.push_str(&format!("# {} 提交分析报告\n\n", repo_name));
-		   report.push_str("## 总结\n\n");
-		   let total_commits = entries.len();
-		   if from_str == to_str {
-			   report.push_str(&format!("本报告扫描了 {} 包 {} 月份的提交，共计 {} 个。\n\n", repo_name, from_str, total_commits));
-		   } else {
-			   report.push_str(&format!("本报告扫描了 {} 包 {} 至 {} 的提交，共计 {} 个。\n\n", repo_name, from_str, to_str, total_commits));
-		   }
-		   report.push_str("---\n\n");
-
-		   // 先分析所有commit，按类型分组，收集hash和建议
-		   let mut type_map: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new(); // 分类 -> [(hash, subject, 建议)]
+		   let mut type_map: BTreeMap<String, Vec<(String, String, String, String)>> = BTreeMap::new(); // 分类 -> [(hash, summary, impact, suggestion)]
 		   let mut detail_map: BTreeMap<String, Vec<String>> = BTreeMap::new(); // 分类 -> [详细分析]
-		   for (_idx, (h, dt, subject)) in entries.iter().enumerate() {
+		   let total_to_analyze = entries.len();
+		   for (idx, (h, dt, subject)) in entries.iter().enumerate() {
 			   let diff = get_commit_diff(&repo_path, h);
 			   let header = format!("Commit subject: {}\nCommit date: {}\n\n", subject, dt.to_rfc3339());
 			   let combined = format!("{}{}", header, diff);
-			   let entry_title = format!("**Commit `{}`**  \n**提交时间：{}**  \n**提交标题：{}**  \n\n", h, dt.format("%Y-%m-%d %H:%M:%S %:z"), subject);
+			   let short_hash = h.chars().take(8).collect::<String>();
+				   let entry_title = format!("**Commit `{}`**  \n**长哈希：{}**  \n**提交时间：{}**  \n**提交标题：{}**  \n\n", short_hash, h, dt.format("%Y-%m-%d %H:%M:%S %:z"), subject);
 			   match analyze_with_llm(&api_url, &api_key, &combined).await {
 				   Ok(analysis) => {
 					   let category = parse_category_from_analysis(&analysis).unwrap_or_else(|| classify_to_category(&analysis));
-					   // 安全修复和bug修复强制建议合入，其他类型让AI分析建议
-					   let suggestion = if category == "安全修复" || category == "bug修复" {
+					   let mut summary = String::new();
+					   let mut impact = String::new();
+					   let mut lines = analysis.lines();
+					   // 跳过首行分类
+					   let _ = lines.next();
+					   if let Some(line) = lines.next() {
+						   summary = line.trim().to_string();
+					   }
+					   if let Some(line) = lines.next() {
+						   impact = line.trim().to_string();
+					   }
+					   // 不再二次分析 summary，无论是否为中文，直接用主分析结果
+					   // 优化建议等级分布逻辑，优先匹配并确保每个等级都能被 deepseek 结果覆盖，且分布更均匀
+					   let suggestion = if category == "安全修复" {
+						   "立刻合入".to_string()
+					   } else if category == "bug修复" {
 						   "建议合入".to_string()
+					   } else if ["文档变更", "构建/CI", "配置变更", "兼容性"].contains(&category) {
+						   // 杂项类型一律归为“不影响”
+						   "不影响".to_string()
 					   } else {
-						   let mut ai_suggestion = "建议个人复核".to_string();
+						   // 依次查找所有建议等级，优先出现的为准，确保每个等级都能被覆盖
+						   let mut found = None;
+						   let mut found_level = 10; // 越小优先级越高
 						   for line in analysis.lines() {
 							   let l = line.trim();
+							   if l.contains("立刻合入") && found_level > 1 {
+								   found = Some("立刻合入".to_string());
+								   found_level = 1;
+							   }
+							   if l.contains("建议合入") && found_level > 2 {
+								   found = Some("建议合入".to_string());
+								   found_level = 2;
+							   }
+							   if l.contains("人工复核") && found_level > 3 {
+								   found = Some("人工复核".to_string());
+								   found_level = 3;
+							   }
+							   if l.contains("不影响") && found_level > 4 {
+								   found = Some("不影响".to_string());
+								   found_level = 4;
+							   }
 							   if l.starts_with("建议：") || l.starts_with("建议:") {
-								   ai_suggestion = l.trim_start_matches("建议：").trim_start_matches("建议:").trim().to_string();
-								   break;
+								   let s = l.trim_start_matches("建议：").trim_start_matches("建议:").trim();
+								   if s.contains("立刻合入") && found_level > 1 {
+									   found = Some("立刻合入".to_string());
+									   found_level = 1;
+								   }
+								   if s.contains("建议合入") && found_level > 2 {
+									   found = Some("建议合入".to_string());
+									   found_level = 2;
+								   }
+								   if s.contains("人工复核") && found_level > 3 {
+									   found = Some("人工复核".to_string());
+									   found_level = 3;
+								   }
+								   if s.contains("不影响") && found_level > 4 {
+									   found = Some("不影响".to_string());
+									   found_level = 4;
+								   }
 							   }
 						   }
-						   ai_suggestion
+						   found.unwrap_or_else(|| "人工复核".to_string())
 					   };
-					   type_map.entry(category.to_string()).or_default().push((h.clone(), subject.clone(), suggestion.clone()));
-					   // 详细分析
+					   // summary 为空时 fallback 用 impact
+					   let summary_final = if summary.is_empty() { impact.clone() } else { summary.clone() };
+					   type_map.entry(category.to_string()).or_default().push((short_hash.clone(), summary_final, impact.clone(), suggestion.clone()));
+					   // 详细分析：不再输出 summary/一句话总结，只输出剩余内容，且用长哈希
 					   let mut entry = String::new();
 					   entry.push_str(&entry_title);
 					   let mut lines = analysis.lines();
+					   // 跳过首行分类和 summary
+					   let _ = lines.next();
+					   let _ = lines.next();
+					   // 跳过第三行（原本 impact，防止 LLM 把一句话总结写到第三行）
+					   let _ = lines.next();
 					   while let Some(line) = lines.next() {
+						   // 跳过任何包含“一句话总结”的行
 						   let trimmed = line.trim_start();
+						   if trimmed.contains("一句话总结") { continue; }
 						   if trimmed.starts_with('#') {
 							   let title = trimmed.trim_start_matches('#').trim();
 							   if !title.is_empty() {
@@ -464,17 +518,90 @@ async fn main() {
 					   entry.push_str(&entry_title);
 					   entry.push_str(&format!("**分析失败：{}**\n\n---\n\n", e));
 					   detail_map.entry("分析失败".to_string()).or_default().push(entry);
-					   type_map.entry("分析失败".to_string()).or_default().push((h.clone(), subject.clone(), "建议个人复核".to_string()));
+					   type_map.entry("分析失败".to_string()).or_default().push((short_hash.clone(), "分析失败".to_string(), String::new(), "人工复核".to_string()));
+				   }
+			   }
+			   let left = total_to_analyze - idx - 1;
+			   info!("本次分析后剩余 commit 数量: {}", left);
+		   }
+
+		   let mut report = String::new();
+		   // 章节1：报告总结
+		   report.push_str(&format!("# {} 提交分析报告\n\n", repo_name));
+		   report.push_str("## 总结\n\n");
+		   let total_commits = entries.len();
+		   // 统计各分类数量、建议合入/个人复核数量
+		   let mut category_count: BTreeMap<String, usize> = BTreeMap::new();
+		   let mut suggest_merge = 0;
+		   for (cat, commits) in &type_map {
+			   category_count.insert(cat.clone(), commits.len());
+			   for (_hash, _summary, _impact, suggestion) in commits {
+				   if suggestion == "建议合入" {
+					   suggest_merge += 1;
 				   }
 			   }
 		   }
+		   if from_str == to_str {
+			   report.push_str(&format!("本报告扫描了 {} 包 {} 月份的提交，共计 {} 个。\n", repo_name, from_str, total_commits));
+		   } else {
+			   report.push_str(&format!("本报告扫描了 {} 包 {} 至 {} 的提交，共计 {} 个。\n", repo_name, from_str, to_str, total_commits));
+		   }
+		   // 分类统计
+		   report.push_str("\n各类型提交统计：\n");
+		   for (cat, count) in &category_count {
+			   report.push_str(&format!("- {}：{} 个\n", cat, count));
+		   }
+		   report.push_str(&format!("\n建议合入：{} 个\n\n", suggest_merge));
+		   report.push_str("---\n\n");
 
 		   // 章节2：分类汇总表格
 		   report.push_str("## 分类汇总\n\n");
-		   report.push_str("| 分类 | Commit Hash | 提交标题 | 建议 |\n|---|---|---|---|\n");
+		   report.push_str("| 分类 | 短Hash | 一句话总结 | 建议 |\n|---|---|---|---|\n");
 		   for (cat, commits) in &type_map {
-			   for (hash, subject, suggestion) in commits {
-				   report.push_str(&format!("| {} | {} | {} | {} |\n", cat, hash, subject.replace('|', " "), suggestion));
+			   for (hash, summary, _impact, suggestion) in commits {
+				   // summary 为空、为分类名或无效时 fallback 用 impact 或 commit subject
+				   let mut one_line = summary.trim().to_string();
+				   // 移除所有常见 LLM 前缀（如“**一句话总结**：”、“**分类**：”、“分类：”等）
+				   let mut s = one_line.as_str();
+				   let strip_prefixes = [
+					   "**一句话总结**：", "**一句话总结**:", "**一句话总结**", "**一句话总结：**", "**一句话总结:**", "**一句话总结：", "**一句话总结:",
+					   "一句话总结：", "一句话总结:", "一句话总结",
+					   "**分类**：", "**分类**:", "**分类**", "分类：", "分类:", "分类"
+				   ];
+				   for prefix in strip_prefixes.iter() {
+					   if let Some(rest) = s.strip_prefix(prefix) {
+						   s = rest.trim_start_matches('：').trim_start_matches(':').trim();
+					   }
+				   }
+				   one_line = s.to_string();
+				   // 判断是否为分类名、空或“分类”/“**分类**”等
+				   let category_names = [
+					   "bug修复", "功能增强", "性能优化", "安全修复", "构建/CI", "配置变更", "兼容性", "文档变更", "重构", "测试", "其他",
+					   "分类", "**分类**"
+				   ];
+				   let is_invalid = one_line.is_empty() || category_names.iter().any(|n| n == &one_line) || one_line.trim_matches('*').trim_matches('：').trim_matches(':').trim() == "分类";
+				   if is_invalid {
+					   // fallback 用 impact
+					   one_line = _impact.trim().to_string();
+				   }
+				   // 如果 impact 也无效，再 fallback 用 subject
+				   let is_still_invalid = one_line.is_empty() || category_names.iter().any(|n| n == &one_line) || one_line.trim_matches('*').trim_matches('：').trim_matches(':').trim() == "分类";
+				   if is_still_invalid {
+					   let subject = entries.iter().find_map(|(h, _dt, subj)| {
+						   if h.chars().take(8).collect::<String>() == *hash {
+							   Some(subj)
+						   } else {
+							   None
+						   }
+					   })
+					   .map(|s| s.trim().to_string())
+					   .unwrap_or_else(|| "无".to_string());
+					   one_line = subject;
+				   }
+				   if one_line.chars().count() > 40 {
+					   one_line = one_line.chars().take(40).collect::<String>() + "...";
+				   }
+				   report.push_str(&format!("| {} | {} | {} | {} |\n", cat, hash, one_line.replace('|', " "), suggestion));
 			   }
 		   }
 		   report.push_str("\n---\n\n");
@@ -483,7 +610,14 @@ async fn main() {
 		   for (cat, entries) in &detail_map {
 			   report.push_str(&format!("## {}\n\n", cat));
 			   for entry in entries {
-				   report.push_str(entry);
+				   // 确保每个 entry 结尾有换行和分隔符，避免片段不完整
+				   let trimmed = entry.trim_end();
+				   report.push_str(trimmed);
+				   if !trimmed.ends_with("---") {
+					   report.push_str("\n---\n\n");
+				   } else {
+					   report.push_str("\n\n");
+				   }
 			   }
 		   }
 
