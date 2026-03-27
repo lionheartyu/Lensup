@@ -11,8 +11,8 @@
 - `LLM_BASE_URL`：LLM API 完整 URL（必填）
 - `REPO_PATH`：本地待分析仓库路径（必填）
 - `COMMIT_LIMIT`：最大分析提交数（可选，默认0为不限制）
-- `ANALYSIS_FROM`/`ANALYSIS_TO`：分析区间（YYYY-MM，可选）
-- `RUST_LOG`：日志级别（可选，info/debug/warn/error）
+- `ANALYSIS_DELAY_MONTHS`:(默认6个月，但是不分析需要填写日期)如果用 --from/--to 指定了具体区间，这个参数不会生效。
+- `RUST_LOG`：日志级别（可设置，info/debug/warn/error）
 
 ## 3. 编译
 在rust环境配置好的情况下
@@ -23,15 +23,15 @@ chmod +x set_mirror.sh
 chmod +x build.sh
 ./build.sh
 ```
-
+## 此处是REPO_PATH中去设置仓库路径的操作。
 ## 4. 运行
-分析单月：比如分析3月份的commit
+分析单月：比如分析apt 3月份的commit
 ```sh
-lensup --from 2026-03
+lensup apt --from 2026-03
 ```
-分析区间：比如分析2月份和3月份的commit`
+分析区间：比如分析systemd 2月份和3月份的commit`
 ```sh
-lensup --from 2026-02 --to 2026-03
+lensup systemd --from 2026-02 --to 2026-03
 ```
 
 ## 5. 输出说明

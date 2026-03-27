@@ -152,12 +152,28 @@ async fn main() {
 	// 1. 获取 LLM API key、API url、repo 路径、commit 数量等参数
 	let api_key = env::var("DEEPSEEK_API_KEY").expect("请设置 DEEPSEEK_API_KEY 环境变量");
 	let api_url = env::var("LLM_BASE_URL").expect("请设置 LLM_BASE_URL 环境变量");
-	let repo_path = env::var("REPO_PATH").expect("请设置 REPO_PATH 环境变量");
-	// 获取库名（repo_path 最后一级目录名）
+
+	let args: Vec<String> = env::args().collect();
+
+	// 新方式：必须指定 lensup <repo_name> ...
+	let repo_name = if args.len() > 1 && !args[1].starts_with("--") {
+		args[1].clone()
+	} else {
+		eprintln!("用法: lensup <repo_name> --from YYYY-MM [--to YYYY-MM] ...");
+		std::process::exit(1);
+	};
+
+	// 只用 .env 的 REPO_PATH 作为根目录
+	let repo_root = env::var("REPO_PATH").expect("请设置 REPO_PATH 环境变量为仓库根目录");
+	let repo_path = format!("{}/{}", repo_root.trim_end_matches('/'), repo_name);
+
 	let repo_name = Path::new(&repo_path)
 		.file_name()
 		.and_then(|s| s.to_str())
 		.unwrap_or("repo");
+
+	// 参数解析起始下标（repo_name 占用 args[1]，从 2 开始）
+	let mut i = 2;
 	let mut commit_limit: usize = env::var("COMMIT_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
 	let delay_months: i32 = env::var("ANALYSIS_DELAY_MONTHS").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
 	info!("配置: repo_path={}, commit_limit={}, delay_months={}, only_categorized(default)={}", repo_path, commit_limit, delay_months, true);
@@ -165,9 +181,6 @@ async fn main() {
 	// 可选参数：命令行 --from YYYY-MM 和 --to YYYY-MM，或回退到环境变量 ANALYSIS_FROM / ANALYSIS_TO
 	let mut from_month: Option<(i32, u32)> = None;
 	let mut to_month: Option<(i32, u32)> = None;
-	// 旧逻辑遗留变量，已不再使用，无需定义 only_categorized
-	let args: Vec<String> = env::args().collect();
-	let mut i = 1;
 	while i < args.len() {
 		match args[i].as_str() {
 			"--from" => {
