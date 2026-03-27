@@ -23,10 +23,14 @@ cargo build --release
 分析单月：比如分析3月份的commit
 ```sh
  cargo run -- --from 2026-03
+ 或运行二进制文件
+ ./target/debug/pr-tools --from 2026-03
 ```
-分析区间：比如分析2月份和3月份的commit
+分析区间：比如分析2月份和3月份的commit`
 ```sh
 cargo run -- --from 2026-02 --to 2026-03
+或运行二进制文件
+ ./target/debug/pr-tools --from 2026-02 --to 2026-03
 ```
 
 ## 5. 输出说明

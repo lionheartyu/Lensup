@@ -1,13 +1,14 @@
-// _____________________________
+// =============================
 //
-//           lensup
-// _____________________________
+//           lensup1.0
+// =============================
 
 use std::process::Command;
 use std::env;
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use chrono::{DateTime, Datelike, FixedOffset};
+use pr_tools::{parse_yyyy_mm, month_index, classify_to_category, parse_category_from_analysis};
 use std::path::Path;
 use tracing::{debug, error, info, warn};
 use tracing_appender::rolling::RollingFileAppender;
@@ -19,95 +20,12 @@ use tracing_subscriber::prelude::*;
 
 
 // 解析 YYYY-MM (或 YYYY-M) 字符串为 (year, month)
-/// Parse a string formatted as "YYYY-MM" or "YYYY-M" into (year, month).
-/// Returns None if parsing fails or month is out of range.
-fn parse_yyyy_mm(s: &str) -> Option<(i32, u32)> {
-	let parts: Vec<&str> = s.split('-').collect();
-	if parts.len() != 2 { return None; }
-	if let (Ok(y), Ok(m)) = (parts[0].parse::<i32>(), parts[1].parse::<u32>()) {
-		if m >= 1 && m <= 12 {
-			return Some((y, m));
-		}
-	}
-	None
-}
-
-/// 将年/月转换为单调递增的月份索引，便于区间比较
-fn month_index(year: i32, month: u32) -> i32 {
-	year * 12 + month as i32
-}
-
-// 将 LLM 的分析文本映射到五类之一：bug修复、功能增强、文档变更、重构、其他
-/// Heuristic mapping from free-text LLM analysis to a fixed category.
-/// This uses a set of keyword checks (Chinese + English) and returns
-/// one of the fixed category strings used by the reports.
-fn classify_to_category(analysis: &str) -> &'static str {
-	let s = analysis.to_lowercase();
-	// 优先匹配包含关键字的情况
-	if s.contains("bug") || s.contains("修复") || s.contains("修补") {
-		return "bug修复";
-	}
-	if s.contains("功能") || s.contains("增强") || s.contains("feature") {
-		return "功能增强";
-	}
-	if s.contains("性能") || s.contains("优化") || s.contains("performance") {
-		return "性能优化";
-	}
-	if s.contains("安全") || s.contains("vuln") || s.contains("cve") {
-		return "安全修复";
-	}
-	if s.contains("build") || s.contains("ci") || s.contains("cmake") || s.contains("makefile") {
-		return "构建/CI";
-	}
-	if s.contains("配置") || s.contains("config") || s.contains("配置变更") {
-		return "配置变更";
-	}
-	if s.contains("兼容") || s.contains("compat") {
-		return "兼容性";
-	}
-	if s.contains("文档") || s.contains("man/") || s.contains("readme") {
-		return "文档变更";
-	}
-	if s.contains("重构") || s.contains("refactor") {
-		return "重构";
-	}
-	// 其余归为其他
-	"其他"
-}
-
-// 尝试从 LLM 的分析文本首行解析明确的分类声明（例如："分类：其他" 或单行的 "其他"）
-/// Attempt to parse an explicit category declared by the LLM.
-/// Many LLM prompts start with a single-line category (e.g. "分类：其他").
-/// If found, return the normalized category string used by the app.
-fn parse_category_from_analysis(analysis: &str) -> Option<&'static str> {
-	if let Some(first_line) = analysis.lines().next() {
-		let s = first_line.trim().to_lowercase();
-		// 移除前缀如 "分类：" 或 "分类:" 或 "category:" 等
-		let s = s.strip_prefix("分类：").or_else(|| s.strip_prefix("分类:")).unwrap_or(&s);
-		let s = s.strip_prefix("category:").unwrap_or(s).trim();
-		match s {
-			"bug修复" | "bug" | "修复" | "修补" => return Some("bug修复"),
-			"功能增强" | "功能" | "feature" => return Some("功能增强"),
-			"性能优化" | "性能" | "优化" => return Some("性能优化"),
-			"安全修复" | "安全" | "cve" | "vuln" => return Some("安全修复"),
-			"构建" | "ci" | "构建/ci" | "build" => return Some("构建/CI"),
-			"配置变更" | "配置" | "config" => return Some("配置变更"),
-			"兼容性" | "兼容" | "compat" => return Some("兼容性"),
-			"文档变更" | "文档" | "translation" | "翻译" => return Some("文档变更"),
-			"重构" | "refactor" => return Some("重构"),
-			"测试" => return Some("测试"),
-			"其他" | "other" => return Some("其他"),
-			_ => {}
-		}
-	}
-	None
-}
 
 // 已移除：不再提取并写入单独的 module 文件夹，统一归类到固定分类文件
 
 // 获取 commit 哈希值及提交时间（ISO8601）列表
-/// Return a Vec of (commit_hash, commit_date (with offset), subject) for the
-/// given repository path. Uses `git log --pretty=format:%H|%cI|%s`.
+// 返回指定仓库路径下所有提交的 (commit_hash, commit_date(带时区), subject) 元组列表。
+// 使用 `git log --pretty=format:%H|%cI|%s` 命令获取。
 fn get_commit_hashes_with_date(repo_path: &str) -> Vec<(String, DateTime<FixedOffset>, String)> {
 	// 输出格式：<hash>|<commit-date ISO8601>|<subject>
 	let output = Command::new("git")
@@ -134,9 +52,8 @@ fn get_commit_hashes_with_date(repo_path: &str) -> Vec<(String, DateTime<FixedOf
 	res
 }
 
-// 获取某个 commit 的 diff
-/// Return the full `git show <hash>` output as a string. On failure this will
-/// panic (like before) — callers expect a valid diff string for LLM analysis.
+// 获取指定 commit 的完整 diff 内容。
+// 失败时会 panic，调用者需保证 hash 有效。
 fn get_commit_diff(repo_path: &str, hash: &str) -> String {
 	let output = Command::new("git")
 		.arg("-C")
@@ -148,11 +65,9 @@ fn get_commit_diff(repo_path: &str, hash: &str) -> String {
 	String::from_utf8_lossy(&output.stdout).to_string()
 }
 
-// 调用 LLM API 进行分析并分类，并打印调试信息
-/// Call the configured LLM API to analyze a commit (subject + diff).
-/// The function returns the textual analysis produced by the model. It logs a
-/// short preview and the HTTP status. The full response is returned if the
-/// JSON structure doesn't match the expected shape.
+// 调用 LLM API 对提交（subject + diff）进行分析和分类，并打印调试信息。
+// 返回模型生成的分析文本。
+// 若返回 JSON 结构不符预期，则直接返回原始文本。
 async fn analyze_with_llm(api_url: &str, api_key: &str, diff: &str) -> Result<String, reqwest::Error> {
 	let prompt = "请对以下提交（包含 commit subject 与 diff）做详细分析：\n1) 先将 commit subject 翻译成中文，作为‘一句话总结’输出在第二行；\n2) 用一句话给出分类（如：bug修复、功能增强、无影响的翻译、文档变更、重构、测试、其他）；\n3) 给出 2-4 行的简要说明，说明修改目的和主要影响；\n4) 列出可能受影响的模块或文件路径（如果能推断）；\n5) 评估回归风险并给出建议（如是否需要回归测试、注意点等）。\n请先输出分类（单行），再输出 subject 中文翻译（单行），随后用小标题和段落输出其他内容，全部使用中文。";
 	let client = reqwest::Client::new();
@@ -201,22 +116,20 @@ async fn analyze_with_llm(api_url: &str, api_key: &str, diff: &str) -> Result<St
 
 #[tokio::main]
 async fn main() {
-	// initialize tracing subscriber for logging output and show only INFO+ in the terminal
-	// (DEBUG messages will be hidden). You can still enable DEBUG by setting RUST_LOG=debug
-	// Allow RUST_LOG to control verbosity; default to INFO if unset.
+	// 初始化日志系统，默认只在终端显示 INFO 及以上级别（可通过 RUST_LOG=debug 开启 DEBUG）。
+	// 日志同时写入 logs 目录下的滚动日志文件。
 	let level = env::var("RUST_LOG").ok().and_then(|v| v.parse::<tracing::Level>().ok()).unwrap_or(tracing::Level::INFO);
 
-	// Ensure logs directory exists
+	// 确保 logs 目录存在
 	if let Err(e) = create_dir_all("logs") {
 		error!("无法创建 logs 目录: {}", e);
 	}
 
-	// Create a rolling daily file appender under logs/
-	// Filename: logs/lensup-YYYY-MM-DD.log (handled by tracing_appender)
+	// 创建每日滚动日志文件 logs/lensup.log
 	let file_appender: RollingFileAppender = tracing_appender::rolling::daily("logs", "lensup.log");
 	let (non_blocking, _guard): (NonBlocking, _) = tracing_appender::non_blocking(file_appender);
 
-	// Build two layers: one writing to file (no ANSI colors), another to stdout.
+	// 日志分为文件和终端两层，文件无颜色，终端有颜色
 	let file_layer = tracing_subscriber::fmt::layer()
 		.with_writer(non_blocking)
 		.with_ansi(false)
@@ -249,7 +162,7 @@ async fn main() {
 	let delay_months: i32 = env::var("ANALYSIS_DELAY_MONTHS").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
 	info!("配置: repo_path={}, commit_limit={}, delay_months={}, only_categorized(default)={}", repo_path, commit_limit, delay_months, true);
 
-	// optional: CLI args --from YYYY-MM and --to YYYY-MM, or fall back to env ANALYSIS_FROM / ANALYSIS_TO
+	// 可选参数：命令行 --from YYYY-MM 和 --to YYYY-MM，或回退到环境变量 ANALYSIS_FROM / ANALYSIS_TO
 	let mut from_month: Option<(i32, u32)> = None;
 	let mut to_month: Option<(i32, u32)> = None;
 	// 旧逻辑遗留变量，已不再使用，无需定义 only_categorized
@@ -316,9 +229,7 @@ async fn main() {
 
 	debug!("日期范围: from={:?} to={:?}", from_month, to_month);
 
-	// If user only provided one bound (e.g. --from 2026-03 but not --to),
-	// treat it as a single-month selection (from == to). This avoids
-	// interpreting --from as open-ended and accidentally including other months.
+	// 如果用户只提供了一个边界（如 --from 2026-03 但没有 --to），则视为单月分析（from == to）
 	if from_month.is_some() && to_month.is_none() {
 		to_month = from_month;
 	}
@@ -326,7 +237,7 @@ async fn main() {
 		from_month = to_month;
 	}
 
-	// 区间反向自动交换
+	// 区间反向时自动交换
 	if let (Some((from_y, from_m)), Some((to_y, to_m))) = (from_month, to_month) {
 		let from_idx = month_index(from_y, from_m);
 		let to_idx = month_index(to_y, to_m);
@@ -337,16 +248,14 @@ async fn main() {
 		}
 	}
 
-	// allow env var to control only-categorized. 已废弃，无需处理
-
-	// also allow ANALYSIS_LIMIT to override commit_limit
+	// 允许 ANALYSIS_LIMIT 环境变量覆盖 commit_limit
 	if let Ok(v) = env::var("ANALYSIS_LIMIT") {
 		if let Ok(n) = v.parse::<usize>() {
 			commit_limit = n;
 		}
 	}
 
-	// ensure reports dir
+	// 确保 reports 目录存在
 	if let Err(e) = create_dir_all("reports") {
 		error!("无法创建 reports 目录: {}", e);
 		return;
@@ -354,7 +263,7 @@ async fn main() {
 		debug!("确保存在 reports/ 目录");
 	}
 
-	// 2. 在获取 commit 列表前先尝试 pull 最新代码（保证分析使用远端最新提交）
+	// 2. 获取 commit 列表前先 git pull 保证分析最新提交
 	info!("在 {} 上执行 git pull 更新仓库", repo_path);
 	match Command::new("git").arg("-C").arg(&repo_path).arg("pull").output() {
 		Ok(out) => {
@@ -581,18 +490,29 @@ async fn main() {
 					   }
 				   }
 				   one_line = s.to_string();
-				   // 判断是否为分类名、空或“分类”/“**分类**”等
+				   // 判断是否为分类名、空、“分类”、或常见无效模板内容
 				   let category_names = [
 					   "bug修复", "功能增强", "性能优化", "安全修复", "构建/CI", "配置变更", "兼容性", "文档变更", "重构", "测试", "其他",
 					   "分类", "**分类**"
 				   ];
-				   let is_invalid = one_line.is_empty() || category_names.iter().any(|n| n == &one_line) || one_line.trim_matches('*').trim_matches('：').trim_matches(':').trim() == "分类";
+				   // 常见无效/模板化描述
+				   let invalid_summaries = [
+					   "有一句话总结", "一句话总结", "重构的描述", "功能增强的描述", "bug修复的描述", "安全修复的描述", "性能优化的描述", "文档变更的描述", "测试的描述", "其他的描述", "无效内容", "暂无", "无"
+				   ];
+				   let cleaned = one_line.trim_matches('*').trim_matches('：').trim_matches(':').trim();
+				   let is_invalid = one_line.is_empty()
+					   || category_names.iter().any(|n| n == &one_line)
+					   || cleaned == "分类"
+					   || invalid_summaries.iter().any(|inv| cleaned == *inv);
 				   if is_invalid {
-					   // fallback 用 impact
 					   one_line = _impact.trim().to_string();
 				   }
 				   // 如果 impact 也无效，再 fallback 用 subject
-				   let is_still_invalid = one_line.is_empty() || category_names.iter().any(|n| n == &one_line) || one_line.trim_matches('*').trim_matches('：').trim_matches(':').trim() == "分类";
+				   let cleaned2 = one_line.trim_matches('*').trim_matches('：').trim_matches(':').trim();
+				   let is_still_invalid = one_line.is_empty()
+					   || category_names.iter().any(|n| n == &one_line)
+					   || cleaned2 == "分类"
+					   || invalid_summaries.iter().any(|inv| cleaned2 == *inv);
 				   if is_still_invalid {
 					   let subject = entries.iter().find_map(|(h, _dt, subj)| {
 						   if h.chars().take(8).collect::<String>() == *hash {
