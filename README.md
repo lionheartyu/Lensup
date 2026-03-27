@@ -10,7 +10,7 @@
 - `DEEPSEEK_API_KEY`：LLM 服务的 API Key（必填）
 - `LLM_BASE_URL`：LLM API 完整 URL（必填）
 - `REPO_PATH`：本地待分析仓库路径（必填）
-- `COMMIT_LIMIT`：最大分析提交数（可选，默认5，0为不限制）
+- `COMMIT_LIMIT`：最大分析提交数（可选，默认0为不限制）
 - `ANALYSIS_FROM`/`ANALYSIS_TO`：分析区间（YYYY-MM，可选）
 - `RUST_LOG`：日志级别（可选，info/debug/warn/error）
 
