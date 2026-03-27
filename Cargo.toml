@@ -1,5 +1,5 @@
 [package]
-name = "pr-tools"
+name = "lensup"
 version = "0.1.0"
 edition = "2021"
 

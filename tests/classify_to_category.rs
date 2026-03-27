@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use pr_tools::*;
+    use lensup::*;
 
     #[test]
     fn test_classify_to_category_bug() {

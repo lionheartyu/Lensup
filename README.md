@@ -15,22 +15,23 @@
 - `RUST_LOG`：日志级别（可选，info/debug/warn/error）
 
 ## 3. 编译
+在rust环境配置好的情况下
 ```sh
-cargo build --release
+chmod +x set_mirror.sh
+./set_mirror.sh
+
+chmod +x build.sh
+./build.sh
 ```
 
 ## 4. 运行
 分析单月：比如分析3月份的commit
 ```sh
- cargo run -- --from 2026-03
- 或运行二进制文件
- ./target/debug/pr-tools --from 2026-03
+lensup --from 2026-03
 ```
 分析区间：比如分析2月份和3月份的commit`
 ```sh
-cargo run -- --from 2026-02 --to 2026-03
-或运行二进制文件
- ./target/debug/pr-tools --from 2026-02 --to 2026-03
+lensup --from 2026-02 --to 2026-03
 ```
 
 ## 5. 输出说明
@@ -40,9 +41,4 @@ cargo run -- --from 2026-02 --to 2026-03
 ## 6. 常见问题
 - LLM 调用失败：检查 API Key、URL、网络
 - 构建失败：确保 Rust 和 Git 安装正常
-
-## 7. 最小运行示例
-```sh
-DEEPSEEK_API_KEY=xxx LLM_BASE_URL=https://... REPO_PATH=/your/repo cargo run -- --from 2026-03
-```
 

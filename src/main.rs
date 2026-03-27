@@ -8,7 +8,7 @@ use std::env;
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use chrono::{DateTime, Datelike, FixedOffset};
-use pr_tools::{parse_yyyy_mm, month_index, classify_to_category, parse_category_from_analysis};
+use lensup::{parse_yyyy_mm, month_index, classify_to_category, parse_category_from_analysis};
 use std::path::Path;
 use tracing::{debug, error, info, warn};
 use tracing_appender::rolling::RollingFileAppender;
