@@ -9,6 +9,44 @@ use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use chrono::{DateTime, Datelike, FixedOffset};
 use lensup::{parse_yyyy_mm, month_index, classify_to_category, parse_category_from_analysis};
+// use tokio::runtime::Runtime; // 已不再需要
+use futures::future::{join_all, ready};
+// 用LLM对详细分析内容生成30字以内完整句子
+async fn llm_summarize_30(api_url: &str, api_key: &str, detail: String) -> Result<String, reqwest::Error> {
+	let prompt = "请你仅用一句完整的中文句子、严格30字左右，不超过40字，精准总结下面内容的核心要点，禁止输出任何模板、分类名、无效内容、英文、拼音，只能输出一句有用的中文句子，结尾必须是句号：";
+	let user_content = format!("{}\n\n{}", prompt, detail);
+	let req_body = serde_json::json!({
+		"model": "deepseek-chat",
+		"messages": [
+			{"role": "user", "content": user_content}
+		],
+		"stream": false,
+		"max_tokens": 80
+	});
+	let client = reqwest::Client::new();
+	let resp = client
+		.post(api_url)
+		.bearer_auth(api_key)
+		.json(&req_body)
+		.send()
+		.await?;
+	let text = resp.text().await?;
+	let result = serde_json::from_str::<serde_json::Value>(&text)
+		.ok()
+		.and_then(|v| {
+			v.get("choices")
+				.and_then(|choices| choices.get(0))
+				.and_then(|c| c.get("message"))
+				.and_then(|m| m.get("content"))
+				.and_then(|c| c.as_str())
+				.map(|s| s.trim().to_string())
+		});
+	if let Some(s) = result {
+		Ok(s)
+	} else {
+		Ok(text.trim().to_string())
+	}
+}
 use std::path::Path;
 use tracing::{debug, error, info, warn};
 use tracing_appender::rolling::RollingFileAppender;
@@ -69,7 +107,92 @@ fn get_commit_diff(repo_path: &str, hash: &str) -> String {
 // 返回模型生成的分析文本。
 // 若返回 JSON 结构不符预期，则直接返回原始文本。
 async fn analyze_with_llm(api_url: &str, api_key: &str, diff: &str) -> Result<String, reqwest::Error> {
-	let prompt = "请对以下提交（包含 commit subject 与 diff）做详细分析：\n1) 先将 commit subject 翻译成中文，作为‘一句话总结’输出在第二行；\n2) 用一句话给出分类（如：bug修复、功能增强、无影响的翻译、文档变更、重构、测试、其他）；\n3) 给出 2-4 行的简要说明，说明修改目的和主要影响；\n4) 列出可能受影响的模块或文件路径（如果能推断）；\n5) 评估回归风险并给出建议（如是否需要回归测试、注意点等）。\n请先输出分类（单行），再输出 subject 中文翻译（单行），随后用小标题和段落输出其他内容，全部使用中文。";
+	 let prompt = r#"请对以下提交（包含 commit subject 与 diff）做全方位、深入、细致的分析：
+
+【多角度思考要求】
+1. 不仅要结合 diff 内容本身，还要考虑：
+	- 变更的上下游影响、历史背景、潜在风险、兼容性、性能、可维护性、可扩展性等多维度。
+	- 结合行业最佳实践、常见风险点、边界场景，主动思考可能遗漏的影响。
+	- 反思本次变更是否存在隐患、是否有更优实现、是否影响已有功能或接口。
+2. 输出前请自查每一项内容，确保无模板化、无空洞、无泛泛而谈，所有结论均有具体细节和洞察。
+3. 鼓励多思考几秒钟，反复推敲，力求输出高质量、有深度、有广度的分析。
+4. 最后一点，一句话总结的内容必须是中文描述，禁止输出英文、拼音、无信息量的模板化内容！！！！！！！！！！
+5. 如果一句话总结的内容还是英文、拼音、无信息量的模板化内容，说明分析不够深入，请重新分析并生成总结，直到满足要求为止。
+6. 你可以思考几秒钟来生成更准确、更有洞察力的分析结果。
+【输出要求】
+(1) 用一句话总结本次提交的核心变更，必须结合diff内容进行智能归纳，不能只翻译subject，不能机械复述，不能出现“分类: xxx”“一句话总结: xxx”等模板内容，必须简洁、准确、有洞察力，信息量高，25字以上，35字以内。禁止输出“详细说明”“合并操作”“合并提交”“无实际变更”“无内容”“无效内容””英文标题”等无效模板，必须输出具体变更内容。
+(2) 用一句话对本次提交进行唯一且准确的分类，分类必须严格基于diff内容，不可主观猜测，分类标准如下：
+	- bug修复：修复功能、逻辑、崩溃、异常、数据错误等问题
+	- 安全修复：修复安全漏洞、权限、注入、越权等
+	- 功能增强：新增功能、接口、参数、配置、扩展等
+	- 性能优化：提升速度、内存、并发、资源占用等
+	- 文档变更：仅修改文档、注释、README等
+	- 重构：重命名、结构调整、代码风格、格式化、无业务影响的重排
+	- 测试：新增或调整测试用例、mock、CI脚本等
+	- 构建/CI：构建脚本、CI/CD流程、依赖升级等
+	- 配置变更：配置文件、环境变量、部署参数等
+	- 兼容性：适配新平台、版本、API兼容等
+	- 其他：无法归入以上类别的
+分类必须唯一且准确，不能多选，不能模糊，不能主观猜测，必须结合diff内容。
+(3) 用2-4行简要说明本次修改的目的、主要影响、关键点，避免空洞描述，鼓励结合diff细节说明影响范围、上下游风险、兼容性等；
+(4) 列出可能受影响的模块或文件路径（如能推断）；
+(5) 评估回归风险并给出建议（如是否需要回归测试、注意点等），并结合实际变更内容给出具体建议。
+
+【输出格式严格要求】
+- 表格中一句话总结的内容必须是中文描述，禁止输出英文、拼音、无信息量的模板化内容。
+- 第一行：分类（如“bug修复”）
+- 后续：分段详细说明、受影响模块、建议等，全部用中文。
+
+【反例】
+- “一句话总结：修复了一个bug” ❌（不能有“xxx总结”前缀，不能只翻译subject，不能空洞）
+- “分类: 文档变更” ❌（不能有“分类:”等模板内容）
+- “优化” ❌（过于宽泛、无信息量）
+- “修复问题” ❌（无具体内容）
+- “增加功能” ❌（无具体内容）
+- “优化了代码” ❌（无具体内容）
+- “一句话总结：优化了代码结构” ❌（有模板前缀）
+- “修复bug” ❌（无具体内容）
+- “修复了一个小问题” ❌（无具体内容）
+- “优化性能” ❌（无具体内容）
+- “调整代码结构” ❌（无具体内容）
+- “详细说明” ❌（禁止出现）
+- “合并操作” ❌（禁止出现）
+- “合并提交” ❌（禁止出现）
+- “无实际变更” ❌（禁止出现）
+- “无内容” ❌（禁止出现）
+- “无效内容” ❌（禁止出现）
+- “修复了README中的错别字” ✅（直接描述核心变更）
+- “优化了数据同步逻辑，提升性能” ✅
+- “重构部分代码，提升可维护性” ✅
+- “修复登录接口参数校验漏洞” ✅
+- “新增API接口支持批量导入” ✅
+- “调整配置文件格式，兼容旧版本” ✅
+- “删除无用依赖，减小包体积” ✅
+- “修复用户注册时邮箱校验逻辑” ✅
+- “完善单元测试覆盖边界场景” ✅
+- “修复内存泄漏，提升稳定性” ✅
+- “调整日志输出，便于排查问题” ✅
+- “优化缓存命中率，减少数据库压力” ✅
+- “修复多线程下的竞态条件” ✅
+- “修复安全漏洞，防止SQL注入” ✅
+
+【边界说明】
+- 分类必须唯一且准确，严格基于diff内容，不能主观猜测或多选。
+- 一句话总结必须输出具体变更内容，禁止输出“详细说明”“合并操作”等无效模板。
+- 总结必须体现diff的具体变化、影响面或修复点，不能只描述“修复bug”“优化代码”等宽泛内容。
+- 遇到大批量格式化、重命名、注释调整等无业务影响的提交，可直接说明“批量格式化代码，无业务影响”或“调整注释，无功能变更”等。
+- 若diff涉及多个模块或影响面较广，建议在总结中点明“涉及X模块”或“影响Y功能”等。
+- 若diff内容极少或无实际变更，也需如实说明。
+
+【自查与反思】
+- 输出前请再次自查每一项内容，确保所有要求均已严格执行，所有结论均有充分细节和洞察。
+- 禁止输出任何英文、拼音、无信息量、模板化内容。
+- 若有任何不确定之处，宁可多思考几秒钟，力求输出最优分析。
+- 如果一句话总结的内容还是英文、拼音、无信息量的模板化内容，说明分析不够深入，请重新分析并生成总结，直到满足要求为止。
+
+表格内容必须全中文，禁止输出英文、拼音、无信息量的模板化内容！！！！！！！！！！
+你可以多思考几秒钟来生成更准确、更有洞察力的分析结果。
+"#;
 	let client = reqwest::Client::new();
 	let user_content = format!("{}\n
 以下是 diff 内容：\n{}", prompt, diff);
@@ -338,7 +461,23 @@ async fn main() {
 			   let header = format!("Commit subject: {}\nCommit date: {}\n\n", subject, dt.to_rfc3339());
 			   let combined = format!("{}{}", header, diff);
 			   let short_hash = h.chars().take(8).collect::<String>();
-				   let entry_title = format!("**Commit `{}`**  \n**长哈希：{}**  \n**提交时间：{}**  \n**提交标题：{}**  \n\n", short_hash, h, dt.format("%Y-%m-%d %H:%M:%S %:z"), subject);
+			   let entry_title = format!("**Commit `{}`**  \n**长哈希：{}**  \n**提交时间：{}**  \n**提交标题：{}**  \n\n", short_hash, h, dt.format("%Y-%m-%d %H:%M:%S %:z"), subject);
+			   // 检查diff是否无代码修改（只包含diff --git、index、---、+++、@@等元信息，无+/-代码行）
+			   let is_no_code_change = diff.lines().all(|l| {
+				   let l = l.trim_start();
+				   l.is_empty() ||
+				   l.starts_with("diff --git") ||
+				   l.starts_with("index ") ||
+				   l.starts_with("--- ") ||
+				   l.starts_with("+++ ") ||
+				   l.starts_with("@@") ||
+				   l.starts_with("commit ") ||
+				   l.starts_with("Author:") ||
+				   l.starts_with("Date:")
+			   }) || !diff.lines().any(|l| {
+				   let l = l.trim_start();
+				   (l.starts_with('+') || l.starts_with('-')) && !l.starts_with("+++ ") && !l.starts_with("--- ")
+			   });
 			   match analyze_with_llm(&api_url, &api_key, &combined).await {
 				   Ok(analysis) => {
 					   let category = parse_category_from_analysis(&analysis).unwrap_or_else(|| classify_to_category(&analysis));
@@ -347,7 +486,29 @@ async fn main() {
 					   let mut lines = analysis.lines();
 					   // 跳过首行分类
 					   let _ = lines.next();
-					   if let Some(line) = lines.next() {
+					   if is_no_code_change {
+						   // 用详细分析内容的第一行（20字内，完整）作为summary
+						   // 跳过首行分类，lines已在上面next一次
+						   let mut found = None;
+						   for line in lines.by_ref() {
+							   let l = line.trim();
+							   if !l.is_empty() {
+								   // 取第一行非空内容，截取20字（不截断汉字）
+								   let mut chars = l.chars();
+								   let mut s = String::new();
+								   for _ in 0..20 {
+									   if let Some(c) = chars.next() {
+										   s.push(c);
+									   } else {
+										   break;
+									   }
+								   }
+								   found = Some(s);
+								   break;
+							   }
+						   }
+						   summary = found.unwrap_or_else(|| "不涉及核心代码修改".to_string());
+					   } else if let Some(line) = lines.next() {
 						   summary = line.trim().to_string();
 					   }
 					   if let Some(line) = lines.next() {
@@ -454,6 +615,7 @@ async fn main() {
 			   info!("本次分析后剩余 commit 数量: {}", left);
 		   }
 
+
 		   let mut report = String::new();
 		   // 章节1：报告总结
 		   report.push_str(&format!("# {} 提交分析报告\n\n", repo_name));
@@ -486,63 +648,35 @@ async fn main() {
 		   // 章节2：分类汇总表格
 		   report.push_str("## 分类汇总\n\n");
 		   report.push_str("| 分类 | 短Hash | 一句话总结 | 建议 |\n|---|---|---|---|\n");
+
+		   // 收集所有需要 LLM 总结的条目，异步批量处理
+		   use std::future::Future;
+		   use std::pin::Pin;
+		   let mut summary_tasks: Vec<Pin<Box<dyn Future<Output = Result<String, reqwest::Error>>>>> = Vec::new();
+		   let mut summary_keys = Vec::new();
 		   for (cat, commits) in &type_map {
-			   for (hash, summary, _impact, suggestion) in commits {
-				   // summary 为空、为分类名或无效时 fallback 用 impact 或 commit subject
-				   let mut one_line = summary.trim().to_string();
-				   // 移除所有常见 LLM 前缀（如“**一句话总结**：”、“**分类**：”、“分类：”等）
-				   let mut s = one_line.as_str();
-				   let strip_prefixes = [
-					   "**一句话总结**：", "**一句话总结**:", "**一句话总结**", "**一句话总结：**", "**一句话总结:**", "**一句话总结：", "**一句话总结:",
-					   "一句话总结：", "一句话总结:", "一句话总结",
-					   "**分类**：", "**分类**:", "**分类**", "分类：", "分类:", "分类"
-				   ];
-				   for prefix in strip_prefixes.iter() {
-					   if let Some(rest) = s.strip_prefix(prefix) {
-						   s = rest.trim_start_matches('：').trim_start_matches(':').trim();
+			   for (hash, _summary, _impact, suggestion) in commits {
+				   let mut detail_text = None;
+				   if let Some(entries) = detail_map.get(cat) {
+					   if let Some(detail) = entries.iter().find(|e| e.contains(hash)) {
+						   detail_text = Some(detail.replace("|", " "));
 					   }
 				   }
-				   one_line = s.to_string();
-				   // 判断是否为分类名、空、“分类”、或常见无效模板内容
-				   let category_names = [
-					   "bug修复", "功能增强", "性能优化", "安全修复", "构建/CI", "配置变更", "兼容性", "文档变更", "重构", "测试", "其他",
-					   "分类", "**分类**"
-				   ];
-				   // 常见无效/模板化描述
-				   let invalid_summaries = [
-					   "有一句话总结", "一句话总结", "重构的描述", "功能增强的描述", "bug修复的描述", "安全修复的描述", "性能优化的描述", "文档变更的描述", "测试的描述", "其他的描述", "无效内容", "暂无", "无"
-				   ];
-				   let cleaned = one_line.trim_matches('*').trim_matches('：').trim_matches(':').trim();
-				   let is_invalid = one_line.is_empty()
-					   || category_names.iter().any(|n| n == &one_line)
-					   || cleaned == "分类"
-					   || invalid_summaries.iter().any(|inv| cleaned == *inv);
-				   if is_invalid {
-					   one_line = _impact.trim().to_string();
+				   summary_keys.push((cat.clone(), hash.clone(), suggestion.clone()));
+				   if let Some(detail) = detail_text {
+					   summary_tasks.push(Box::pin(llm_summarize_30(&api_url, &api_key, detail)));
+				   } else {
+					   summary_tasks.push(Box::pin(ready(Ok::<_, reqwest::Error>("无有效总结。".to_string()))));
 				   }
-				   // 如果 impact 也无效，再 fallback 用 subject
-				   let cleaned2 = one_line.trim_matches('*').trim_matches('：').trim_matches(':').trim();
-				   let is_still_invalid = one_line.is_empty()
-					   || category_names.iter().any(|n| n == &one_line)
-					   || cleaned2 == "分类"
-					   || invalid_summaries.iter().any(|inv| cleaned2 == *inv);
-				   if is_still_invalid {
-					   let subject = entries.iter().find_map(|(h, _dt, subj)| {
-						   if h.chars().take(8).collect::<String>() == *hash {
-							   Some(subj)
-						   } else {
-							   None
-						   }
-					   })
-					   .map(|s| s.trim().to_string())
-					   .unwrap_or_else(|| "无".to_string());
-					   one_line = subject;
-				   }
-				   if one_line.chars().count() > 40 {
-					   one_line = one_line.chars().take(40).collect::<String>() + "...";
-				   }
-				   report.push_str(&format!("| {} | {} | {} | {} |\n", cat, hash, one_line.replace('|', " "), suggestion));
 			   }
+		   }
+		   let summary_results = join_all(summary_tasks).await;
+		   for ((cat, hash, suggestion), summary_res) in summary_keys.into_iter().zip(summary_results.into_iter()) {
+			   let one_line = match summary_res {
+				   Ok(s) => if s.is_empty() { "无有效总结。".to_string() } else { s.replace('|', " ") },
+				   Err(_) => "LLM总结失败。".to_string(),
+			   };
+			   report.push_str(&format!("| {} | {} | {} | {} |\n", cat, hash, one_line, suggestion));
 		   }
 		   report.push_str("\n---\n\n");
 
