@@ -16,7 +16,7 @@ async fn llm_summarize_30(api_url: &str, api_key: &str, detail: String) -> Resul
 	let prompt = "请你仅用一句完整的中文句子、严格30字左右，不超过40字，精准总结下面内容的核心要点，禁止输出任何模板、分类名、无效内容、英文、拼音，只能输出一句有用的中文句子，结尾必须是句号：";
 	let user_content = format!("{}\n\n{}", prompt, detail);
 	let req_body = serde_json::json!({
-		"model": "deepseek-chat",
+		"model": "deepseek-v3.2",
 		"messages": [
 			{"role": "user", "content": user_content}
 		],
@@ -197,7 +197,7 @@ async fn analyze_with_llm(api_url: &str, api_key: &str, diff: &str) -> Result<St
 	let user_content = format!("{}\n
 以下是 diff 内容：\n{}", prompt, diff);
 	let req_body = serde_json::json!({
-		"model": "deepseek-chat",
+		"model": "deepseek-v3.2",
 		"messages": [
 			{"role": "user", "content": user_content}
 		],
@@ -557,9 +557,35 @@ async fn main() {
 						   }
 						   suggestion = found;
 					   }
-					   // bug修复和安全修复强制建议合入
-					   let suggestion = match category {
-						   "bug修复" | "安全修复" => "建议合入".to_string(),
+					   // bug修复强制“立刻合入”；安全修复“建议合入”；功能增强类：翻译/版本更新建议合入，无代码变更建议“不影响”，其余由LLM分析内容判断
+					   let suggestion = match &*category {
+						   "bug修复" => "立刻合入".to_string(),
+						   "安全修复" => "建议合入".to_string(),
+						   "功能增强" => {
+							   // 判断是否为翻译或版本更新
+							   let lower_subject = subject.to_lowercase();
+							   if lower_subject.contains("翻译") || lower_subject.contains("translation") || lower_subject.contains("manpage") || lower_subject.contains("版本") || lower_subject.contains("release") || lower_subject.contains("ver") {
+								   "建议合入".to_string()
+							   } else if is_no_code_change {
+								   "不影响".to_string()  
+							   } else {
+								   // LLM分析内容中优先级：建议合入 > 人工复核
+								   let mut found = None;
+								   let mut found_level = 10;
+								   for line in analysis.lines() {
+									   let l = line.trim();
+									   if l.contains("建议合入") && found_level > 1 {
+										   found = Some("建议合入".to_string());
+										   found_level = 1;
+									   }
+									   if l.contains("人工复核") && found_level > 2 {
+										   found = Some("人工复核".to_string());
+										   found_level = 2;
+									   }
+								   }
+								   found.unwrap_or_else(|| "人工复核".to_string())
+							   }
+						   },
 						   _ => suggestion.unwrap_or_else(|| "人工复核".to_string()),
 					   };
 
@@ -624,11 +650,15 @@ async fn main() {
 		   // 统计各分类数量、建议合入/个人复核数量
 		   let mut category_count: BTreeMap<String, usize> = BTreeMap::new();
 		   let mut suggest_merge = 0;
+		   let mut instant_merge = 0;
 		   for (cat, commits) in &type_map {
 			   category_count.insert(cat.clone(), commits.len());
 			   for (_hash, _summary, _impact, suggestion) in commits {
 				   if suggestion == "建议合入" {
 					   suggest_merge += 1;
+				   }
+				   if suggestion == "立刻合入" {
+					   instant_merge += 1;
 				   }
 			   }
 		   }
@@ -642,7 +672,7 @@ async fn main() {
 		   for (cat, count) in &category_count {
 			   report.push_str(&format!("- {}：{} 个\n", cat, count));
 		   }
-		   report.push_str(&format!("\n建议合入：{} 个\n\n", suggest_merge));
+		   report.push_str(&format!("\n建议合入：{} 个\n立刻合入：{} 个\n\n", suggest_merge, instant_merge));
 		   report.push_str("---\n\n");
 
 		   // 章节2：分类汇总表格
