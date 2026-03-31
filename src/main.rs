@@ -24,27 +24,59 @@ async fn llm_summarize_30(api_url: &str, api_key: &str, detail: String) -> Resul
 		"max_tokens": 80
 	});
 	let client = reqwest::Client::new();
-	let resp = client
-		.post(api_url)
-		.bearer_auth(api_key)
-		.json(&req_body)
-		.send()
-		.await?;
-	let text = resp.text().await?;
-	let result = serde_json::from_str::<serde_json::Value>(&text)
-		.ok()
-		.and_then(|v| {
-			v.get("choices")
-				.and_then(|choices| choices.get(0))
-				.and_then(|c| c.get("message"))
-				.and_then(|m| m.get("content"))
-				.and_then(|c| c.as_str())
-				.map(|s| s.trim().to_string())
-		});
-	if let Some(s) = result {
-		Ok(s)
+	let mut last_err = None;
+	for attempt in 1..=50 {
+		tracing::debug!("llm_summarize_30 attempt {}/50", attempt);
+		let resp = match client
+			.post(api_url)
+			.bearer_auth(api_key)
+			.json(&req_body)
+			.send()
+			.await {
+			Ok(r) => r,
+			Err(e) => {
+				last_err = Some(e);
+				tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+				continue;
+			}
+		};
+		let text = match resp.text().await {
+			Ok(t) => t,
+			Err(e) => {
+				last_err = Some(e);
+				tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+				continue;
+			}
+		};
+		// 检查是否为 LLM 超限或报错
+		if text.contains("ModelAccountTpmRateLimitExceeded") || text.contains("error") {
+			tracing::warn!("llm_summarize_30 LLM 超限或报错，重试");
+			tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+			continue;
+		}
+		let result = serde_json::from_str::<serde_json::Value>(&text)
+			.ok()
+			.and_then(|v| {
+				v.get("choices")
+					.and_then(|choices| choices.get(0))
+					.and_then(|c| c.get("message"))
+					.and_then(|m| m.get("content"))
+					.and_then(|c| c.as_str())
+					.map(|s| s.trim().to_string())
+			});
+		if let Some(s) = result {
+			return Ok(s);
+		} else {
+			tracing::warn!("llm_summarize_30 无法从 LLM JSON 提取 message.content，重试");
+			tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+			continue;
+		}
+	}
+	tracing::error!("llm_summarize_30 连续50次失败，跳过此次调用");
+	if let Some(e) = last_err {
+		Err(e)
 	} else {
-		Ok(text.trim().to_string())
+		panic!("llm_summarize_30 连续50次失败")
 	}
 }
 use std::path::Path;
