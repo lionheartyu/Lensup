@@ -20,34 +20,44 @@ pub fn month_index(year: i32, month: u32) -> i32 {
 /// 将 LLM 的分析文本映射到固定分类。
 pub fn classify_to_category(analysis: &str) -> &'static str {
     let s = analysis.to_lowercase();
-    if s.contains("bug") || s.contains("修复") || s.contains("修补") {
-        return "bug修复";
-    }
-    if s.contains("翻译") || s.contains("translation") || s.contains("translate") {
-        return "功能增强";
-    }
-    if s.contains("功能") || s.contains("增强") || s.contains("feature") {
-        return "功能增强";
-    }
-    if s.contains("性能") || s.contains("优化") || s.contains("performance") {
-        return "性能优化";
-    }
-    if s.contains("安全") || s.contains("vuln") || s.contains("cve") {
+    // 安全修复
+    if s.contains("安全") || s.contains("vuln") || s.contains("cve") || s.contains("xss") || s.contains("csrf") || s.contains("注入") || s.contains("越权") || s.contains("权限") || s.contains("加密") || s.contains("泄漏") {
         return "安全修复";
     }
-    if s.contains("build") || s.contains("ci") || s.contains("cmake") || s.contains("makefile") {
-        return "构建/CI";
+    // bug修复
+    if s.contains("bug") || s.contains("修复") || s.contains("修补") || s.contains("fix") || s.contains("defect") || s.contains("错误") || s.contains("异常") || s.contains("崩溃") || s.contains("回退") {
+        return "bug修复";
     }
-    if s.contains("配置") || s.contains("config") || s.contains("配置变更") {
-        return "配置变更";
+    // 功能增强
+    if s.contains("功能") || s.contains("增强") || s.contains("feature") || s.contains("新增") || s.contains("添加") || s.contains("支持") || s.contains("扩展") || s.contains("翻译") || s.contains("translation") || s.contains("translate") {
+        return "功能增强";
     }
-    if s.contains("兼容") || s.contains("compat") {
-        return "兼容性";
-    }
-    if s.contains("文档") || s.contains("man/") || s.contains("readme") {
+    // 文档变更
+    if s.contains("文档") || s.contains("man/") || s.contains("readme") || s.contains("注释") || s.contains("说明") || s.contains("文档更新") {
         return "文档变更";
     }
-    if s.contains("重构") || s.contains("refactor") {
+    // 性能优化
+    if s.contains("性能") || s.contains("优化") || s.contains("performance") || s.contains("加速") || s.contains("提升速度") || s.contains("内存") || s.contains("并发") || s.contains("资源占用") {
+        return "性能优化";
+    }
+    // 测试
+    if s.contains("测试") || s.contains("test") || s.contains("单元测试") || s.contains("mock") || s.contains("ci脚本") || s.contains("覆盖率") {
+        return "测试";
+    }
+    // 构建/CI
+    if s.contains("build") || s.contains("ci") || s.contains("cmake") || s.contains("makefile") || s.contains("编译") || s.contains("构建") || s.contains("ci/cd") || s.contains("依赖升级") {
+        return "构建/CI";
+    }
+    // 配置变更
+    if s.contains("配置") || s.contains("config") || s.contains("配置变更") || s.contains("环境变量") || s.contains("部署参数") {
+        return "配置变更";
+    }
+    // 兼容性
+    if s.contains("兼容") || s.contains("compat") || s.contains("适配") || s.contains("api兼容") || s.contains("平台") {
+        return "兼容性";
+    }
+    // 重构
+    if s.contains("重构") || s.contains("refactor") || s.contains("重命名") || s.contains("结构调整") || s.contains("格式化") || s.contains("代码风格") || s.contains("无业务影响") {
         return "重构";
     }
     "其他"
@@ -60,17 +70,17 @@ pub fn parse_category_from_analysis(analysis: &str) -> Option<&'static str> {
         let s = s.strip_prefix("分类：").or_else(|| s.strip_prefix("分类:")).unwrap_or(&s);
         let s = s.strip_prefix("category:").unwrap_or(s).trim();
         match s {
+            "安全修复" | "安全" | "cve" | "vuln" => return Some("安全修复"),
             "bug修复" | "bug" | "修复" | "修补" => return Some("bug修复"),
             "翻译" | "translation" | "translate" => return Some("功能增强"),
+            "文档变更" | "文档" => return Some("文档变更"),
             "功能增强" | "功能" | "feature" => return Some("功能增强"),
             "性能优化" | "性能" | "优化" => return Some("性能优化"),
-            "安全修复" | "安全" | "cve" | "vuln" => return Some("安全修复"),
             "构建" | "ci" | "构建/ci" | "build" => return Some("构建/CI"),
             "配置变更" | "配置" | "config" => return Some("配置变更"),
             "兼容性" | "兼容" | "compat" => return Some("兼容性"),
-            "文档变更" | "文档" => return Some("文档变更"),
-            "重构" | "refactor" => return Some("重构"),
             "测试" => return Some("测试"),
+            "重构" | "refactor" => return Some("重构"),
             "其他" | "other" => return Some("其他"),
             _ => {}
         }
