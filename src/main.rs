@@ -592,7 +592,7 @@ async fn main() {
 					   // bug修复强制“立刻合入”；安全修复“建议合入”；功能增强类：翻译/版本更新建议合入，无代码变更建议“不影响”，其余由LLM分析内容判断
 					   let suggestion = match &*category {
 						   "bug修复" => "立刻合入".to_string(),
-						   "安全修复" => "建议合入".to_string(),
+						   "安全修复" => "立刻合入".to_string(),
 						   "功能增强" => {
 							   // 判断是否为翻译或版本更新
 							   let lower_subject = subject.to_lowercase();
