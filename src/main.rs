@@ -688,6 +688,10 @@ async fn main() {
 			   for (_hash, _summary, _impact, suggestion) in commits {
 				   if suggestion == "建议合入" {
 					   suggest_merge += 1;
+					   // 安全修复也计入立刻合入
+					   if cat == "安全修复" {
+						   instant_merge += 1;
+					   }
 				   }
 				   if suggestion == "立刻合入" {
 					   instant_merge += 1;
