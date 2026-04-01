@@ -5,6 +5,7 @@
 
 use std::process::Command;
 use std::env;
+use std::sync::{Arc, Mutex};
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use chrono::{DateTime, Datelike, FixedOffset};
@@ -12,7 +13,15 @@ use lensup::{parse_yyyy_mm, month_index, classify_to_category, parse_category_fr
 // use tokio::runtime::Runtime; // 已不再需要
 use futures::future::{join_all, ready};
 // 用LLM对详细分析内容生成30字以内完整句子
-async fn llm_summarize_30(api_url: &str, api_key: &str, detail: String) -> Result<String, reqwest::Error> {
+async fn llm_summarize_30(api_url: &str, api_keys: Arc<Mutex<Vec<String>>>, key_idx: Arc<Mutex<usize>>, detail: String) -> Result<String, reqwest::Error> {
+	// 轮询选择API key
+	let key = {
+		let mut idx = key_idx.lock().unwrap();
+		let keys = api_keys.lock().unwrap();
+		let key = keys.get(*idx % keys.len()).cloned().unwrap();
+		*idx = (*idx + 1) % keys.len();
+		key
+	};
 	let prompt = "请你仅用一句完整的中文句子、严格30字左右，不超过40字，精准总结下面内容的核心要点，禁止输出任何模板、分类名、无效内容、英文、拼音，只能输出一句有用的中文句子，结尾必须是句号：";
 	let user_content = format!("{}\n\n{}", prompt, detail);
 	let req_body = serde_json::json!({
@@ -29,7 +38,7 @@ async fn llm_summarize_30(api_url: &str, api_key: &str, detail: String) -> Resul
 		tracing::debug!("llm_summarize_30 attempt {}/50", attempt);
 		let resp = match client
 			.post(api_url)
-			.bearer_auth(api_key)
+			.bearer_auth(&key)
 			.json(&req_body)
 			.send()
 			.await {
@@ -138,7 +147,15 @@ fn get_commit_diff(repo_path: &str, hash: &str) -> String {
 // 调用 LLM API 对提交（subject + diff）进行分析和分类，并打印调试信息。
 // 返回模型生成的分析文本。
 // 若返回 JSON 结构不符预期，则直接返回原始文本。
-async fn analyze_with_llm(api_url: &str, api_key: &str, diff: &str) -> Result<String, reqwest::Error> {
+async fn analyze_with_llm(api_url: &str, api_keys: Arc<Mutex<Vec<String>>>, key_idx: Arc<Mutex<usize>>, diff: &str) -> Result<String, reqwest::Error> {
+	// 轮询选择API key
+	let key = {
+		let mut idx = key_idx.lock().unwrap();
+		let keys = api_keys.lock().unwrap();
+		let key = keys.get(*idx % keys.len()).cloned().unwrap();
+		*idx = (*idx + 1) % keys.len();
+		key
+	};
 	 let prompt = r#"请对以下提交（包含 commit subject 与 diff）做全方位、深入、细致的分析：
 
 【多角度思考要求】
@@ -239,7 +256,7 @@ async fn analyze_with_llm(api_url: &str, api_key: &str, diff: &str) -> Result<St
 	debug!("向 LLM 发送请求到 {} (payload bytes: {})", api_url, user_content.len());
 	let resp = client
 		.post(api_url)
-		.bearer_auth(api_key)
+		.bearer_auth(&key)
 		.json(&req_body)
 		.send()
 		.await?;
@@ -305,7 +322,17 @@ async fn main() {
 	dotenv::dotenv().ok();
 
 	// 1. 获取 LLM API key、API url、repo 路径、commit 数量等参数
-	let api_key = env::var("DEEPSEEK_API_KEY").expect("请设置 DEEPSEEK_API_KEY 环境变量");
+	// 支持多个API key，逗号分隔
+	let api_keys: Vec<String> = env::var("DEEPSEEK_API_KEYS")
+		.or_else(|_| env::var("DEEPSEEK_API_KEY"))
+		.expect("请设置 DEEPSEEK_API_KEYS 或 DEEPSEEK_API_KEY 环境变量")
+		.split(',')
+		.map(|s| s.trim().to_string())
+		.filter(|s| !s.is_empty())
+		.collect();
+	assert!(!api_keys.is_empty(), "API key 不能为空");
+	let api_keys = Arc::new(Mutex::new(api_keys));
+	let key_idx = Arc::new(Mutex::new(0usize));
 	let api_url = env::var("LLM_BASE_URL").expect("请设置 LLM_BASE_URL 环境变量");
 
 	let args: Vec<String> = env::args().collect();
@@ -510,7 +537,7 @@ async fn main() {
 				   let l = l.trim_start();
 				   (l.starts_with('+') || l.starts_with('-')) && !l.starts_with("+++ ") && !l.starts_with("--- ")
 			   });
-			   match analyze_with_llm(&api_url, &api_key, &combined).await {
+			   match analyze_with_llm(&api_url, api_keys.clone(), key_idx.clone(), &combined).await {
 				   Ok(analysis) => {
 					   let category = parse_category_from_analysis(&analysis).unwrap_or_else(|| classify_to_category(&analysis));
 					   let mut summary = String::new();
@@ -730,7 +757,7 @@ async fn main() {
 				   }
 				   summary_keys.push((cat.clone(), hash.clone(), suggestion.clone()));
 				   if let Some(detail) = detail_text {
-					   summary_tasks.push(Box::pin(llm_summarize_30(&api_url, &api_key, detail)));
+					   summary_tasks.push(Box::pin(llm_summarize_30(&api_url, api_keys.clone(), key_idx.clone(), detail)));
 				   } else {
 					   summary_tasks.push(Box::pin(ready(Ok::<_, reqwest::Error>("无有效总结。".to_string()))));
 				   }
