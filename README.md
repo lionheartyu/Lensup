@@ -1,4 +1,3 @@
-# 100%AI Coding
 # lensup 操作指南
 
 ## 1. 前置条件
